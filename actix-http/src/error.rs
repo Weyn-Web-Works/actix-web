@@ -366,6 +366,19 @@ impl From<BlockingError<io::Error>> for PayloadError {
     }
 }
 
+impl From<PayloadError> for io::Error {
+    fn from(err: PayloadError) -> Self {
+        match err {
+            PayloadError::Io(err) => err,
+            PayloadError::Incomplete(_) => io::Error::from(io::ErrorKind::UnexpectedEof),
+            PayloadError::EncodingCorrupted => io::Error::from(io::ErrorKind::InvalidData),
+            PayloadError::Overflow => io::Error::from(io::ErrorKind::InvalidData),
+            PayloadError::UnknownLength => io::Error::from(io::ErrorKind::InvalidInput),
+            PayloadError::Http2Payload(_) => io::Error::from(io::ErrorKind::Interrupted)
+        }
+    }
+}
+
 /// `PayloadError` returns two possible results:
 ///
 /// - `Overflow` returns `PayloadTooLarge`
