@@ -9,19 +9,19 @@ use actix_codec::{AsyncRead, AsyncWrite, Framed};
 use actix_rt::net::TcpStream;
 use actix_service::{pipeline_factory, IntoServiceFactory, Service, ServiceFactory};
 use futures_core::ready;
-use futures_util::future::{ok, Ready};
+use futures_util::future::ready;
 
 use crate::body::MessageBody;
 use crate::cloneable::CloneableService;
 use crate::config::ServiceConfig;
-use crate::error::{DispatchError, Error, ParseError};
-use crate::helpers::DataFactory;
+use crate::error::{DispatchError, Error};
 use crate::request::Request;
 use crate::response::Response;
+use crate::{ConnectCallback, Extensions};
 
 use super::codec::Codec;
 use super::dispatcher::Dispatcher;
-use super::{ExpectHandler, Message, UpgradeHandler};
+use super::{ExpectHandler, UpgradeHandler};
 
 /// `ServiceFactory` implementation for HTTP1 transport
 pub struct H1Service<T, S, B, X = ExpectHandler, U = UpgradeHandler<T>> {
@@ -29,7 +29,7 @@ pub struct H1Service<T, S, B, X = ExpectHandler, U = UpgradeHandler<T>> {
     cfg: ServiceConfig,
     expect: X,
     upgrade: Option<U>,
-    on_connect: Option<Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     _t: PhantomData<(T, B)>,
 }
 
@@ -51,7 +51,7 @@ where
             srv: service.into_factory(),
             expect: ExpectHandler,
             upgrade: None,
-            on_connect: None,
+            on_connect_ext: None,
             _t: PhantomData,
         }
     }
@@ -87,7 +87,7 @@ where
     > {
         pipeline_factory(|io: TcpStream| {
             let peer_addr = io.peer_addr().ok();
-            ok((io, peer_addr))
+            ready(Ok((io, peer_addr)))
         })
         .and_then(self)
     }
@@ -136,7 +136,7 @@ mod openssl {
             )
             .and_then(|io: SslStream<TcpStream>| {
                 let peer_addr = io.get_ref().peer_addr().ok();
-                ok((io, peer_addr))
+                ready(Ok((io, peer_addr)))
             })
             .and_then(self.map_err(TlsError::Service))
         }
@@ -186,7 +186,7 @@ mod rustls {
             )
             .and_then(|io: TlsStream<TcpStream>| {
                 let peer_addr = io.get_ref().0.peer_addr().ok();
-                ok((io, peer_addr))
+                ready(Ok((io, peer_addr)))
             })
             .and_then(self.map_err(TlsError::Service))
         }
@@ -212,7 +212,7 @@ where
             cfg: self.cfg,
             srv: self.srv,
             upgrade: self.upgrade,
-            on_connect: self.on_connect,
+            on_connect_ext: self.on_connect_ext,
             _t: PhantomData,
         }
     }
@@ -228,17 +228,14 @@ where
             cfg: self.cfg,
             srv: self.srv,
             expect: self.expect,
-            on_connect: self.on_connect,
+            on_connect_ext: self.on_connect_ext,
             _t: PhantomData,
         }
     }
 
     /// Set on connect callback.
-    pub(crate) fn on_connect(
-        mut self,
-        f: Option<Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
-    ) -> Self {
-        self.on_connect = f;
+    pub(crate) fn on_connect_ext(mut self, f: Option<Rc<ConnectCallback<T>>>) -> Self {
+        self.on_connect_ext = f;
         self
     }
 }
@@ -273,7 +270,7 @@ where
             fut_upg: self.upgrade.as_ref().map(|f| f.new_service(())),
             expect: None,
             upgrade: None,
-            on_connect: self.on_connect.clone(),
+            on_connect_ext: self.on_connect_ext.clone(),
             cfg: Some(self.cfg.clone()),
             _t: PhantomData,
         }
@@ -302,7 +299,7 @@ where
     fut_upg: Option<U::Future>,
     expect: Option<X::Service>,
     upgrade: Option<U::Service>,
-    on_connect: Option<Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     cfg: Option<ServiceConfig>,
     _t: PhantomData<(T, B)>,
 }
@@ -352,23 +349,24 @@ where
 
         Poll::Ready(result.map(|service| {
             let this = self.as_mut().project();
+
             H1ServiceHandler::new(
                 this.cfg.take().unwrap(),
                 service,
                 this.expect.take().unwrap(),
                 this.upgrade.take(),
-                this.on_connect.clone(),
+                this.on_connect_ext.clone(),
             )
         }))
     }
 }
 
-/// `Service` implementation for HTTP1 transport
+/// `Service` implementation for HTTP/1 transport
 pub struct H1ServiceHandler<T, S: Service, B, X: Service, U: Service> {
     srv: CloneableService<S>,
     expect: CloneableService<X>,
     upgrade: Option<CloneableService<U>>,
-    on_connect: Option<Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     cfg: ServiceConfig,
     _t: PhantomData<(T, B)>,
 }
@@ -389,14 +387,14 @@ where
         srv: S,
         expect: X,
         upgrade: Option<U>,
-        on_connect: Option<Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+        on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     ) -> H1ServiceHandler<T, S, B, X, U> {
         H1ServiceHandler {
             srv: CloneableService::new(srv),
             expect: CloneableService::new(expect),
             upgrade: upgrade.map(CloneableService::new),
             cfg,
-            on_connect,
+            on_connect_ext,
             _t: PhantomData,
         }
     }
@@ -462,11 +460,11 @@ where
     }
 
     fn call(&mut self, (io, addr): Self::Request) -> Self::Future {
-        let on_connect = if let Some(ref on_connect) = self.on_connect {
-            Some(on_connect(&io))
-        } else {
-            None
-        };
+        let mut connect_extensions = Extensions::new();
+        if let Some(ref handler) = self.on_connect_ext {
+            // run on_connect_ext callback, populating connect extensions
+            handler(&io, &mut connect_extensions);
+        }
 
         Dispatcher::new(
             io,
@@ -474,108 +472,8 @@ where
             self.srv.clone(),
             self.expect.clone(),
             self.upgrade.clone(),
-            on_connect,
+            connect_extensions,
             addr,
         )
-    }
-}
-
-/// `ServiceFactory` implementation for `OneRequestService` service
-#[derive(Default)]
-pub struct OneRequest<T> {
-    config: ServiceConfig,
-    _t: PhantomData<T>,
-}
-
-impl<T> OneRequest<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    /// Create new `H1SimpleService` instance.
-    pub fn new() -> Self {
-        OneRequest {
-            config: ServiceConfig::default(),
-            _t: PhantomData,
-        }
-    }
-}
-
-impl<T> ServiceFactory for OneRequest<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    type Config = ();
-    type Request = T;
-    type Response = (Request, Framed<T, Codec>);
-    type Error = ParseError;
-    type InitError = ();
-    type Service = OneRequestService<T>;
-    type Future = Ready<Result<Self::Service, Self::InitError>>;
-
-    fn new_service(&self, _: ()) -> Self::Future {
-        ok(OneRequestService {
-            _t: PhantomData,
-            config: self.config.clone(),
-        })
-    }
-}
-
-/// `Service` implementation for HTTP1 transport. Reads one request and returns
-/// request and framed object.
-pub struct OneRequestService<T> {
-    _t: PhantomData<T>,
-    config: ServiceConfig,
-}
-
-impl<T> Service for OneRequestService<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    type Request = T;
-    type Response = (Request, Framed<T, Codec>);
-    type Error = ParseError;
-    type Future = OneRequestServiceResponse<T>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Self::Request) -> Self::Future {
-        OneRequestServiceResponse {
-            framed: Some(Framed::new(req, Codec::new(self.config.clone()))),
-        }
-    }
-}
-
-#[doc(hidden)]
-#[pin_project::pin_project]
-pub struct OneRequestServiceResponse<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    #[pin]
-    framed: Option<Framed<T, Codec>>,
-}
-
-impl<T> Future for OneRequestServiceResponse<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    type Output = Result<(Request, Framed<T, Codec>), ParseError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_mut().project();
-
-        match ready!(this.framed.as_pin_mut().unwrap().next_item(cx)) {
-            Some(Ok(req)) => match req {
-                Message::Item(req) => {
-                    let mut this = self.as_mut().project();
-                    Poll::Ready(Ok((req, this.framed.take().unwrap())))
-                }
-                Message::Chunk(_) => unreachable!("Something is wrong"),
-            },
-            Some(Err(err)) => Poll::Ready(Err(err)),
-            None => Poll::Ready(Err(ParseError::Incomplete)),
-        }
     }
 }

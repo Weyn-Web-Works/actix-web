@@ -2,7 +2,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{net, rc};
+use std::{net, rc::Rc};
 
 use actix_codec::{AsyncRead, AsyncWrite};
 use actix_rt::net::TcpStream;
@@ -20,9 +20,9 @@ use crate::body::MessageBody;
 use crate::cloneable::CloneableService;
 use crate::config::ServiceConfig;
 use crate::error::{DispatchError, Error};
-use crate::helpers::DataFactory;
 use crate::request::Request;
 use crate::response::Response;
+use crate::{ConnectCallback, Extensions};
 
 use super::dispatcher::Dispatcher;
 
@@ -30,7 +30,7 @@ use super::dispatcher::Dispatcher;
 pub struct H2Service<T, S, B> {
     srv: S,
     cfg: ServiceConfig,
-    on_connect: Option<rc::Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     _t: PhantomData<(T, B)>,
 }
 
@@ -49,18 +49,15 @@ where
     ) -> Self {
         H2Service {
             cfg,
-            on_connect: None,
+            on_connect_ext: None,
             srv: service.into_factory(),
             _t: PhantomData,
         }
     }
 
     /// Set on connect callback.
-    pub(crate) fn on_connect(
-        mut self,
-        f: Option<rc::Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
-    ) -> Self {
-        self.on_connect = f;
+    pub(crate) fn on_connect_ext(mut self, f: Option<Rc<ConnectCallback<T>>>) -> Self {
+        self.on_connect_ext = f;
         self
     }
 }
@@ -202,7 +199,7 @@ where
         H2ServiceResponse {
             fut: self.srv.new_service(()),
             cfg: Some(self.cfg.clone()),
-            on_connect: self.on_connect.clone(),
+            on_connect_ext: self.on_connect_ext.clone(),
             _t: PhantomData,
         }
     }
@@ -214,7 +211,7 @@ pub struct H2ServiceResponse<T, S: ServiceFactory, B> {
     #[pin]
     fut: S::Future,
     cfg: Option<ServiceConfig>,
-    on_connect: Option<rc::Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     _t: PhantomData<(T, B)>,
 }
 
@@ -236,7 +233,7 @@ where
             let this = self.as_mut().project();
             H2ServiceHandler::new(
                 this.cfg.take().unwrap(),
-                this.on_connect.clone(),
+                this.on_connect_ext.clone(),
                 service,
             )
         }))
@@ -247,7 +244,7 @@ where
 pub struct H2ServiceHandler<T, S: Service, B> {
     srv: CloneableService<S>,
     cfg: ServiceConfig,
-    on_connect: Option<rc::Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+    on_connect_ext: Option<Rc<ConnectCallback<T>>>,
     _t: PhantomData<(T, B)>,
 }
 
@@ -261,12 +258,12 @@ where
 {
     fn new(
         cfg: ServiceConfig,
-        on_connect: Option<rc::Rc<dyn Fn(&T) -> Box<dyn DataFactory>>>,
+        on_connect_ext: Option<Rc<ConnectCallback<T>>>,
         srv: S,
     ) -> H2ServiceHandler<T, S, B> {
         H2ServiceHandler {
             cfg,
-            on_connect,
+            on_connect_ext,
             srv: CloneableService::new(srv),
             _t: PhantomData,
         }
@@ -296,18 +293,18 @@ where
     }
 
     fn call(&mut self, (io, addr): Self::Request) -> Self::Future {
-        let on_connect = if let Some(ref on_connect) = self.on_connect {
-            Some(on_connect(&io))
-        } else {
-            None
-        };
+        let mut connect_extensions = Extensions::new();
+        if let Some(ref handler) = self.on_connect_ext {
+            // run on_connect_ext callback, populating connect extensions
+            handler(&io, &mut connect_extensions);
+        }
 
         H2ServiceHandlerResponse {
             state: State::Handshake(
                 Some(self.srv.clone()),
                 Some(self.cfg.clone()),
                 addr,
-                on_connect,
+                Some(connect_extensions),
                 server::handshake(io),
             ),
         }
@@ -324,7 +321,7 @@ where
         Option<CloneableService<S>>,
         Option<ServiceConfig>,
         Option<net::SocketAddr>,
-        Option<Box<dyn DataFactory>>,
+        Option<Extensions>,
         Handshake<T, Bytes>,
     ),
 }
@@ -359,14 +356,14 @@ where
                 ref mut srv,
                 ref mut config,
                 ref peer_addr,
-                ref mut on_connect,
+                ref mut on_connect_data,
                 ref mut handshake,
             ) => match Pin::new(handshake).poll(cx) {
                 Poll::Ready(Ok(conn)) => {
                     self.state = State::Incoming(Dispatcher::new(
                         srv.take().unwrap(),
                         conn,
-                        on_connect.take(),
+                        on_connect_data.take().unwrap(),
                         config.take().unwrap(),
                         None,
                         *peer_addr,
