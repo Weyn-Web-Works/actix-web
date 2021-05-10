@@ -28,7 +28,6 @@ struct Config {
     host: Option<String>,
     keep_alive: KeepAlive,
     client_timeout: u64,
-    client_shutdown: u64,
 }
 
 /// An HTTP Server.
@@ -91,7 +90,6 @@ where
                 host: None,
                 keep_alive: KeepAlive::Timeout(5),
                 client_timeout: 5000,
-                client_shutdown: 5000,
             })),
             backlog: 1024,
             sockets: Vec::new(),
@@ -203,19 +201,6 @@ where
     /// By default client timeout is set to 5000 milliseconds.
     pub fn client_timeout(self, val: u64) -> Self {
         self.config.lock().unwrap().client_timeout = val;
-        self
-    }
-
-    /// Set server connection shutdown timeout in milliseconds.
-    ///
-    /// Defines a timeout for shutdown connection. If a shutdown procedure does not complete
-    /// within this time, the request is dropped.
-    ///
-    /// To disable timeout set value to 0.
-    ///
-    /// By default client timeout is set to 5000 milliseconds.
-    pub fn client_shutdown(self, val: u64) -> Self {
-        self.config.lock().unwrap().client_shutdown = val;
         self
     }
 
