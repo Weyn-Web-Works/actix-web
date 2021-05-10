@@ -1,11 +1,7 @@
-use std::convert::TryFrom;
 use std::future::Future;
-use std::time;
 
-use actix_codec::{AsyncRead, AsyncWrite};
+use actix_utils::future::poll_fn;
 use bytes::Bytes;
-use futures_util::future::poll_fn;
-use futures_util::pin_mut;
 use h2::{
     client::{Builder, Connection, SendRequest},
     SendStream,
@@ -13,28 +9,32 @@ use h2::{
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{request::Request, Method, Version};
 
-use crate::body::{BodySize, MessageBody};
-use crate::header::HeaderMap;
-use crate::message::{RequestHeadType, ResponseHead};
-use crate::payload::Payload;
+use crate::{
+    body::{BodySize, MessageBody},
+    header::HeaderMap,
+    message::{RequestHeadType, ResponseHead},
+    payload::Payload,
+    Error,
+};
 
-use super::config::ConnectorConfig;
-use super::connection::{ConnectionType, IoConnection};
-use super::error::SendRequestError;
-use super::pool::Acquired;
+use super::{
+    config::ConnectorConfig,
+    connection::{ConnectionIo, H2Connection},
+    error::SendRequestError,
+};
 
-pub(crate) async fn send_request<T, B>(
-    mut io: SendRequest<Bytes>,
+pub(crate) async fn send_request<Io, B>(
+    mut io: H2Connection<Io>,
     head: RequestHeadType,
     body: B,
-    created: time::Instant,
-    pool: Option<Acquired<T>>,
 ) -> Result<(ResponseHead, Payload), SendRequestError>
 where
-    T: AsyncRead + AsyncWrite + Unpin + 'static,
+    Io: ConnectionIo,
     B: MessageBody,
+    B::Error: Into<Error>,
 {
     trace!("Sending client request: {:?} {:?}", head, body.size());
+
     let head_req = head.as_ref().method == Method::HEAD;
     let length = body.size();
     let eof = matches!(
@@ -60,10 +60,14 @@ where
         BodySize::Empty => req
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from_static("0")),
-        BodySize::Sized(len) => req.headers_mut().insert(
-            CONTENT_LENGTH,
-            HeaderValue::try_from(format!("{}", len)).unwrap(),
-        ),
+        BodySize::Sized(len) => {
+            let mut buf = itoa::Buffer::new();
+
+            req.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(buf.format(len)).unwrap(),
+            )
+        }
     };
 
     // Extracting extra headers from RequestHeadType. HeaderMap::new() does not allocate.
@@ -86,23 +90,26 @@ where
     // copy headers
     for (key, value) in headers {
         match *key {
-            CONNECTION | TRANSFER_ENCODING => continue, // http2 specific
+            // TODO: consider skipping other headers according to:
+            //       https://tools.ietf.org/html/rfc7540#section-8.1.2.2
+            // omit HTTP/1.x only headers
+            CONNECTION | TRANSFER_ENCODING => continue,
             CONTENT_LENGTH if skip_len => continue,
             // DATE => has_date = true,
-            _ => (),
+            _ => {}
         }
         req.headers_mut().append(key, value.clone());
     }
 
     let res = poll_fn(|cx| io.poll_ready(cx)).await;
     if let Err(e) = res {
-        release(io, pool, created, e.is_io());
+        io.on_release(e.is_io());
         return Err(SendRequestError::from(e));
     }
 
     let resp = match io.send_request(req, eof) {
         Ok((fut, send)) => {
-            release(io, pool, created, false);
+            io.on_release(false);
 
             if !eof {
                 send_body(body, send).await?;
@@ -110,7 +117,7 @@ where
             fut.await.map_err(SendRequestError::from)?
         }
         Err(e) => {
-            release(io, pool, created, e.is_io());
+            io.on_release(e.is_io());
             return Err(e.into());
         }
     };
@@ -124,12 +131,16 @@ where
     Ok((head, payload))
 }
 
-async fn send_body<B: MessageBody>(
+async fn send_body<B>(
     body: B,
     mut send: SendStream<Bytes>,
-) -> Result<(), SendRequestError> {
+) -> Result<(), SendRequestError>
+where
+    B: MessageBody,
+    B::Error: Into<Error>,
+{
     let mut buf = None;
-    pin_mut!(body);
+    actix_rt::pin!(body);
     loop {
         if buf.is_none() {
             match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
@@ -137,7 +148,7 @@ async fn send_body<B: MessageBody>(
                     send.reserve_capacity(b.len());
                     buf = Some(b);
                 }
-                Some(Err(e)) => return Err(e.into()),
+                Some(Err(e)) => return Err(e.into().into()),
                 None => {
                     if let Err(e) = send.send_data(Bytes::new(), true) {
                         return Err(e.into());
@@ -171,28 +182,10 @@ async fn send_body<B: MessageBody>(
     }
 }
 
-// release SendRequest object
-fn release<T: AsyncRead + AsyncWrite + Unpin + 'static>(
-    io: SendRequest<Bytes>,
-    pool: Option<Acquired<T>>,
-    created: time::Instant,
-    close: bool,
-) {
-    if let Some(mut pool) = pool {
-        if close {
-            pool.close(IoConnection::new(ConnectionType::H2(io), created, None));
-        } else {
-            pool.release(IoConnection::new(ConnectionType::H2(io), created, None));
-        }
-    }
-}
-
-pub(crate) fn handshake<Io>(
+pub(crate) fn handshake<Io: ConnectionIo>(
     io: Io,
     config: &ConnectorConfig,
 ) -> impl Future<Output = Result<(SendRequest<Bytes>, Connection<Io, Bytes>), h2::Error>>
-where
-    Io: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let mut builder = Builder::new();
     builder

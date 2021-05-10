@@ -23,7 +23,7 @@ pub struct FrozenClientRequest {
     pub(crate) addr: Option<net::SocketAddr>,
     pub(crate) response_decompress: bool,
     pub(crate) timeout: Option<Duration>,
-    pub(crate) config: Rc<ClientConfig>,
+    pub(crate) config: ClientConfig,
 }
 
 impl FrozenClientRequest {
@@ -51,7 +51,7 @@ impl FrozenClientRequest {
             self.addr,
             self.response_decompress,
             self.timeout,
-            self.config.as_ref(),
+            &self.config,
             body,
         )
     }
@@ -62,7 +62,7 @@ impl FrozenClientRequest {
             self.addr,
             self.response_decompress,
             self.timeout,
-            self.config.as_ref(),
+            &self.config,
             value,
         )
     }
@@ -73,7 +73,7 @@ impl FrozenClientRequest {
             self.addr,
             self.response_decompress,
             self.timeout,
-            self.config.as_ref(),
+            &self.config,
             value,
         )
     }
@@ -88,7 +88,7 @@ impl FrozenClientRequest {
             self.addr,
             self.response_decompress,
             self.timeout,
-            self.config.as_ref(),
+            &self.config,
             stream,
         )
     }
@@ -99,7 +99,7 @@ impl FrozenClientRequest {
             self.addr,
             self.response_decompress,
             self.timeout,
-            self.config.as_ref(),
+            &self.config,
         )
     }
 
@@ -144,8 +144,10 @@ impl FrozenSendBuilder {
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into() {
-                Ok(value) => self.extra_headers.insert(key, value),
+            Ok(key) => match value.try_into_value() {
+                Ok(value) => {
+                    self.extra_headers.insert(key, value);
+                }
                 Err(e) => self.err = Some(e.into()),
             },
             Err(e) => self.err = Some(e.into()),
@@ -166,7 +168,7 @@ impl FrozenSendBuilder {
             self.req.addr,
             self.req.response_decompress,
             self.req.timeout,
-            self.req.config.as_ref(),
+            &self.req.config,
             body,
         )
     }
@@ -181,7 +183,7 @@ impl FrozenSendBuilder {
             self.req.addr,
             self.req.response_decompress,
             self.req.timeout,
-            self.req.config.as_ref(),
+            &self.req.config,
             value,
         )
     }
@@ -196,7 +198,7 @@ impl FrozenSendBuilder {
             self.req.addr,
             self.req.response_decompress,
             self.req.timeout,
-            self.req.config.as_ref(),
+            &self.req.config,
             value,
         )
     }
@@ -215,7 +217,7 @@ impl FrozenSendBuilder {
             self.req.addr,
             self.req.response_decompress,
             self.req.timeout,
-            self.req.config.as_ref(),
+            &self.req.config,
             stream,
         )
     }
@@ -230,7 +232,7 @@ impl FrozenSendBuilder {
             self.req.addr,
             self.req.response_decompress,
             self.req.timeout,
-            self.req.config.as_ref(),
+            &self.req.config,
         )
     }
 }

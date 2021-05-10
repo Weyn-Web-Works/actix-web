@@ -1,19 +1,29 @@
 #![cfg(feature = "openssl")]
+
+extern crate tls_openssl as openssl;
+
 use std::io;
 
+use actix_http::{
+    body::{Body, SizedStream},
+    error::{ErrorBadRequest, PayloadError},
+    http::{
+        header::{self, HeaderName, HeaderValue},
+        Method, StatusCode, Version,
+    },
+    Error, HttpMessage, HttpService, Request, Response,
+};
 use actix_http_test::test_server;
-use actix_service::{fn_service, ServiceFactory};
-
+use actix_service::{fn_service, ServiceFactoryExt};
+use actix_utils::future::{err, ok, ready};
 use bytes::{Bytes, BytesMut};
-use futures_util::future::{err, ok, ready};
-use futures_util::stream::{once, Stream, StreamExt};
-use open_ssl::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod};
-
-use actix_http::error::{ErrorBadRequest, PayloadError};
-use actix_http::http::header::{self, HeaderName, HeaderValue};
-use actix_http::http::{Method, StatusCode, Version};
-use actix_http::httpmessage::HttpMessage;
-use actix_http::{body, Error, HttpService, Request, Response};
+use futures_core::Stream;
+use futures_util::stream::{once, StreamExt as _};
+use openssl::{
+    pkey::PKey,
+    ssl::{SslAcceptor, SslMethod},
+    x509::X509,
+};
 
 async fn load_body<S>(stream: S) -> Result<BytesMut, PayloadError>
 where
@@ -33,29 +43,26 @@ where
     Ok(body)
 }
 
-fn ssl_acceptor() -> SslAcceptor {
-    // load ssl keys
+fn tls_config() -> SslAcceptor {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_file = cert.serialize_pem().unwrap();
+    let key_file = cert.serialize_private_key_pem();
+    let cert = X509::from_pem(cert_file.as_bytes()).unwrap();
+    let key = PKey::private_key_from_pem(key_file.as_bytes()).unwrap();
+
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-    builder
-        .set_private_key_file("../tests/key.pem", SslFiletype::PEM)
-        .unwrap();
-    builder
-        .set_certificate_chain_file("../tests/cert.pem")
-        .unwrap();
+    builder.set_certificate(&cert).unwrap();
+    builder.set_private_key(&key).unwrap();
+
     builder.set_alpn_select_callback(|_, protos| {
         const H2: &[u8] = b"\x02h2";
-        const H11: &[u8] = b"\x08http/1.1";
         if protos.windows(3).any(|window| window == H2) {
             Ok(b"h2")
-        } else if protos.windows(9).any(|window| window == H11) {
-            Ok(b"http/1.1")
         } else {
-            Err(AlpnError::NOACK)
+            Err(openssl::ssl::AlpnError::NOACK)
         }
     });
-    builder
-        .set_alpn_protos(b"\x08http/1.1\x02h2")
-        .expect("Can not contrust SslAcceptor");
+    builder.set_alpn_protos(b"\x02h2").unwrap();
 
     builder.build()
 }
@@ -64,8 +71,8 @@ fn ssl_acceptor() -> SslAcceptor {
 async fn test_h2() -> io::Result<()> {
     let srv = test_server(move || {
         HttpService::build()
-            .h2(|_| ok::<_, Error>(Response::Ok().finish()))
-            .openssl(ssl_acceptor())
+            .h2(|_| ok::<_, Error>(Response::ok()))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -82,9 +89,9 @@ async fn test_h2_1() -> io::Result<()> {
             .finish(|req: Request| {
                 assert!(req.peer_addr().is_some());
                 assert_eq!(req.version(), Version::HTTP_2);
-                ok::<_, Error>(Response::Ok().finish())
+                ok::<_, Error>(Response::ok())
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -101,9 +108,9 @@ async fn test_h2_body() -> io::Result<()> {
         HttpService::build()
             .h2(|mut req: Request<_>| async move {
                 let body = load_body(req.take_payload()).await?;
-                Ok::<_, Error>(Response::Ok().body(body))
+                Ok::<_, Error>(Response::ok().set_body(body))
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -121,18 +128,16 @@ async fn test_h2_content_length() {
     let srv = test_server(move || {
         HttpService::build()
             .h2(|req: Request| {
-                let indx: usize = req.uri().path()[1..].parse().unwrap();
+                let idx: usize = req.uri().path()[1..].parse().unwrap();
                 let statuses = [
-                    StatusCode::NO_CONTENT,
                     StatusCode::CONTINUE,
-                    StatusCode::SWITCHING_PROTOCOLS,
-                    StatusCode::PROCESSING,
+                    StatusCode::NO_CONTENT,
                     StatusCode::OK,
                     StatusCode::NOT_FOUND,
                 ];
-                ok::<_, ()>(Response::new(statuses[indx]))
+                ok::<_, ()>(Response::new(statuses[idx]))
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -141,21 +146,29 @@ async fn test_h2_content_length() {
     let value = HeaderValue::from_static("0");
 
     {
-        for i in 0..4 {
+        for &i in &[0] {
+            let req = srv
+                .request(Method::HEAD, srv.surl(&format!("/{}", i)))
+                .send();
+            let _response = req.await.expect_err("should timeout on recv 1xx frame");
+            // assert_eq!(response.headers().get(&header), None);
+
+            let req = srv
+                .request(Method::GET, srv.surl(&format!("/{}", i)))
+                .send();
+            let _response = req.await.expect_err("should timeout on recv 1xx frame");
+            // assert_eq!(response.headers().get(&header), None);
+        }
+
+        for &i in &[1] {
             let req = srv
                 .request(Method::GET, srv.surl(&format!("/{}", i)))
                 .send();
             let response = req.await.unwrap();
             assert_eq!(response.headers().get(&header), None);
-
-            let req = srv
-                .request(Method::HEAD, srv.surl(&format!("/{}", i)))
-                .send();
-            let response = req.await.unwrap();
-            assert_eq!(response.headers().get(&header), None);
         }
 
-        for i in 4..6 {
+        for &i in &[2, 3] {
             let req = srv
                 .request(Method::GET, srv.surl(&format!("/{}", i)))
                 .send();
@@ -173,10 +186,10 @@ async fn test_h2_headers() {
     let mut srv = test_server(move || {
         let data = data.clone();
         HttpService::build().h2(move |_| {
-            let mut builder = Response::Ok();
+            let mut builder = Response::build(StatusCode::OK);
             for idx in 0..90 {
-                builder.header(
-                    format!("X-TEST-{}", idx).as_str(),
+                builder.insert_header(
+                    (format!("X-TEST-{}", idx).as_str(),
                     "TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
@@ -190,11 +203,11 @@ async fn test_h2_headers() {
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST ",
-                );
+                ));
             }
             ok::<_, ()>(builder.body(data.clone()))
         })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
                     .map_err(|_| ())
     }).await;
 
@@ -232,8 +245,8 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 async fn test_h2_body2() {
     let mut srv = test_server(move || {
         HttpService::build()
-            .h2(|_| ok::<_, ()>(Response::Ok().body(STR)))
-            .openssl(ssl_acceptor())
+            .h2(|_| ok::<_, ()>(Response::ok().set_body(STR)))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -250,8 +263,8 @@ async fn test_h2_body2() {
 async fn test_h2_head_empty() {
     let mut srv = test_server(move || {
         HttpService::build()
-            .finish(|_| ok::<_, ()>(Response::Ok().body(STR)))
-            .openssl(ssl_acceptor())
+            .finish(|_| ok::<_, ()>(Response::ok().set_body(STR)))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -274,8 +287,8 @@ async fn test_h2_head_empty() {
 async fn test_h2_head_binary() {
     let mut srv = test_server(move || {
         HttpService::build()
-            .h2(|_| ok::<_, ()>(Response::Ok().body(STR)))
-            .openssl(ssl_acceptor())
+            .h2(|_| ok::<_, ()>(Response::ok().set_body(STR)))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -297,8 +310,8 @@ async fn test_h2_head_binary() {
 async fn test_h2_head_binary2() {
     let srv = test_server(move || {
         HttpService::build()
-            .h2(|_| ok::<_, ()>(Response::Ok().body(STR)))
-            .openssl(ssl_acceptor())
+            .h2(|_| ok::<_, ()>(Response::ok().set_body(STR)))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -319,10 +332,10 @@ async fn test_h2_body_length() {
             .h2(|_| {
                 let body = once(ok(Bytes::from_static(STR.as_ref())));
                 ok::<_, ()>(
-                    Response::Ok().body(body::SizedStream::new(STR.len() as u64, body)),
+                    Response::ok().set_body(SizedStream::new(STR.len() as u64, body)),
                 )
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -342,12 +355,12 @@ async fn test_h2_body_chunked_explicit() {
             .h2(|_| {
                 let body = once(ok::<_, Error>(Bytes::from_static(STR.as_ref())));
                 ok::<_, ()>(
-                    Response::Ok()
-                        .header(header::TRANSFER_ENCODING, "chunked")
+                    Response::build(StatusCode::OK)
+                        .insert_header((header::TRANSFER_ENCODING, "chunked"))
                         .streaming(body),
                 )
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -370,12 +383,12 @@ async fn test_h2_response_http_error_handling() {
             .h2(fn_service(|_| {
                 let broken_header = Bytes::from_static(b"\0\0\0");
                 ok::<_, ()>(
-                    Response::Ok()
-                        .header(header::CONTENT_TYPE, broken_header)
+                    Response::build(StatusCode::OK)
+                        .insert_header((header::CONTENT_TYPE, broken_header))
                         .body(STR),
                 )
             }))
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -392,8 +405,8 @@ async fn test_h2_response_http_error_handling() {
 async fn test_h2_service_error() {
     let mut srv = test_server(move || {
         HttpService::build()
-            .h2(|_| err::<Response, Error>(ErrorBadRequest("error")))
-            .openssl(ssl_acceptor())
+            .h2(|_| err::<Response<Body>, Error>(ErrorBadRequest("error")))
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;
@@ -410,12 +423,14 @@ async fn test_h2_service_error() {
 async fn test_h2_on_connect() {
     let srv = test_server(move || {
         HttpService::build()
-            .on_connect_ext(|_, data| data.insert(20isize))
+            .on_connect_ext(|_, data| {
+                data.insert(20isize);
+            })
             .h2(|req: Request| {
                 assert!(req.extensions().contains::<isize>());
-                ok::<_, ()>(Response::Ok().finish())
+                ok::<_, ()>(Response::ok())
             })
-            .openssl(ssl_acceptor())
+            .openssl(tls_config())
             .map_err(|_| ())
     })
     .await;

@@ -1,4 +1,4 @@
-//! Multipart payload support
+//! Multipart response payload support.
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::convert::TryFrom;
@@ -8,14 +8,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::{cmp, fmt};
 
-use bytes::{Bytes, BytesMut};
-use futures_util::stream::{LocalBoxStream, Stream, StreamExt};
-
-use actix_utils::task::LocalWaker;
 use actix_web::error::{ParseError, PayloadError};
-use actix_web::http::header::{
-    self, ContentDisposition, HeaderMap, HeaderName, HeaderValue,
-};
+use actix_web::http::header::{self, ContentDisposition, HeaderMap, HeaderName, HeaderValue};
+use bytes::{Bytes, BytesMut};
+use futures_core::stream::{LocalBoxStream, Stream};
+use futures_util::stream::StreamExt as _;
+use local_waker::LocalWaker;
 
 use crate::error::MultipartError;
 
@@ -120,10 +118,7 @@ impl Multipart {
 impl Stream for Multipart {
     type Item = Result<Field, MultipartError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(err) = self.error.take() {
             Poll::Ready(Some(Err(err)))
         } else if self.safety.current() {
@@ -142,9 +137,7 @@ impl Stream for Multipart {
 }
 
 impl InnerMultipart {
-    fn read_headers(
-        payload: &mut PayloadBuffer,
-    ) -> Result<Option<HeaderMap>, MultipartError> {
+    fn read_headers(payload: &mut PayloadBuffer) -> Result<Option<HeaderMap>, MultipartError> {
         match payload.read_until(b"\r\n\r\n")? {
             None => {
                 if payload.eof {
@@ -226,8 +219,7 @@ impl InnerMultipart {
                     if chunk.len() < boundary.len() {
                         continue;
                     }
-                    if &chunk[..2] == b"--"
-                        && &chunk[2..chunk.len() - 2] == boundary.as_bytes()
+                    if &chunk[..2] == b"--" && &chunk[2..chunk.len() - 2] == boundary.as_bytes()
                     {
                         break;
                     } else {
@@ -273,9 +265,7 @@ impl InnerMultipart {
                             match field.borrow_mut().poll(safety) {
                                 Poll::Pending => return Poll::Pending,
                                 Poll::Ready(Some(Ok(_))) => continue,
-                                Poll::Ready(Some(Err(e))) => {
-                                    return Poll::Ready(Some(Err(e)))
-                                }
+                                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                                 Poll::Ready(None) => true,
                             }
                         }
@@ -311,10 +301,7 @@ impl InnerMultipart {
                     }
                     // read boundary
                     InnerState::Boundary => {
-                        match InnerMultipart::read_boundary(
-                            &mut *payload,
-                            &self.boundary,
-                        )? {
+                        match InnerMultipart::read_boundary(&mut *payload, &self.boundary)? {
                             None => return Poll::Pending,
                             Some(eof) => {
                                 if eof {
@@ -326,7 +313,7 @@ impl InnerMultipart {
                             }
                         }
                     }
-                    _ => (),
+                    _ => {}
                 }
 
                 // read field headers for next field
@@ -418,8 +405,7 @@ impl Field {
     pub fn content_disposition(&self) -> Option<ContentDisposition> {
         // RFC 7578: 'Each part MUST contain a Content-Disposition header field
         // where the disposition type is "form-data".'
-        if let Some(content_disposition) = self.headers.get(&header::CONTENT_DISPOSITION)
-        {
+        if let Some(content_disposition) = self.headers.get(&header::CONTENT_DISPOSITION) {
             ContentDisposition::from_raw(content_disposition).ok()
         } else {
             None
@@ -430,15 +416,10 @@ impl Field {
 impl Stream for Field {
     type Item = Result<Bytes, MultipartError>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.safety.current() {
             let mut inner = self.inner.borrow_mut();
-            if let Some(mut payload) =
-                inner.payload.as_ref().unwrap().get_mut(&self.safety)
-            {
+            if let Some(mut payload) = inner.payload.as_ref().unwrap().get_mut(&self.safety) {
                 payload.poll_stream(cx)?;
             }
             inner.poll(&self.safety)
@@ -607,8 +588,7 @@ impl InnerField {
             return Poll::Ready(None);
         }
 
-        let result = if let Some(mut payload) = self.payload.as_ref().unwrap().get_mut(s)
-        {
+        let result = if let Some(mut payload) = self.payload.as_ref().unwrap().get_mut(s) {
             if !self.eof {
                 let res = if let Some(ref mut len) = self.length {
                     InnerField::read_len(&mut *payload, len)
@@ -628,7 +608,9 @@ impl InnerField {
                 Ok(None) => Poll::Pending,
                 Ok(Some(line)) => {
                     if line.as_ref() != b"\r\n" {
-                        log::warn!("multipart field did not read all the data or it is malformed");
+                        log::warn!(
+                            "multipart field did not read all the data or it is malformed"
+                        );
                     }
                     Poll::Ready(None)
                 }
@@ -804,9 +786,7 @@ impl PayloadBuffer {
     /// Read bytes until new line delimiter or eof
     pub fn readline_or_eof(&mut self) -> Result<Option<Bytes>, MultipartError> {
         match self.readline() {
-            Err(MultipartError::Incomplete) if self.eof => {
-                Ok(Some(self.buf.split().freeze()))
-            }
+            Err(MultipartError::Incomplete) if self.eof => Ok(Some(self.buf.split().freeze())),
             line => line,
         }
     }
@@ -824,18 +804,19 @@ mod tests {
     use super::*;
 
     use actix_http::h1::Payload;
-    use actix_utils::mpsc;
     use actix_web::http::header::{DispositionParam, DispositionType};
     use actix_web::test::TestRequest;
     use actix_web::FromRequest;
     use bytes::Bytes;
     use futures_util::future::lazy;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
     #[actix_rt::test]
     async fn test_boundary() {
         let headers = HeaderMap::new();
         match Multipart::boundary(&headers) {
-            Err(MultipartError::NoContentType) => (),
+            Err(MultipartError::NoContentType) => {}
             _ => unreachable!("should not happen"),
         }
 
@@ -846,7 +827,7 @@ mod tests {
         );
 
         match Multipart::boundary(&headers) {
-            Err(MultipartError::ParseContentType) => (),
+            Err(MultipartError::ParseContentType) => {}
             _ => unreachable!("should not happen"),
         }
 
@@ -856,7 +837,7 @@ mod tests {
             header::HeaderValue::from_static("multipart/mixed"),
         );
         match Multipart::boundary(&headers) {
-            Err(MultipartError::Boundary) => (),
+            Err(MultipartError::Boundary) => {}
             _ => unreachable!("should not happen"),
         }
 
@@ -875,13 +856,17 @@ mod tests {
     }
 
     fn create_stream() -> (
-        mpsc::Sender<Result<Bytes, PayloadError>>,
+        mpsc::UnboundedSender<Result<Bytes, PayloadError>>,
         impl Stream<Item = Result<Bytes, PayloadError>>,
     ) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
 
-        (tx, rx.map(|res| res.map_err(|_| panic!())))
+        (
+            tx,
+            UnboundedReceiverStream::new(rx).map(|res| res.map_err(|_| panic!())),
+        )
     }
+
     // Stream that returns from a Bytes, one char at a time and Pending every other poll()
     struct SlowStream {
         bytes: Bytes,
@@ -902,19 +887,18 @@ mod tests {
     impl Stream for SlowStream {
         type Item = Result<Bytes, PayloadError>;
 
-        fn poll_next(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
             if !this.ready {
                 this.ready = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
+
             if this.pos == this.bytes.len() {
                 return Poll::Ready(None);
             }
+
             let res = Poll::Ready(Some(Ok(this.bytes.slice(this.pos..(this.pos + 1)))));
             this.pos += 1;
             this.ready = false;
@@ -956,17 +940,17 @@ mod tests {
         let mut multipart = Multipart::new(&headers, payload);
 
         match multipart.next().await.unwrap() {
-            Ok(_) => (),
+            Ok(_) => {}
             _ => unreachable!(),
         }
 
         match multipart.next().await.unwrap() {
-            Ok(_) => (),
+            Ok(_) => {}
             _ => unreachable!(),
         }
 
         match multipart.next().await {
-            None => (),
+            None => {}
             _ => unreachable!(),
         }
     }
@@ -993,7 +977,7 @@ mod tests {
                     _ => unreachable!(),
                 }
                 match field.next().await {
-                    None => (),
+                    None => {}
                     _ => unreachable!(),
                 }
             }
@@ -1010,7 +994,7 @@ mod tests {
                     _ => unreachable!(),
                 }
                 match field.next().await {
-                    None => (),
+                    None => {}
                     _ => unreachable!(),
                 }
             }
@@ -1018,7 +1002,7 @@ mod tests {
         }
 
         match multipart.next().await {
-            None => (),
+            None => {}
             _ => unreachable!(),
         }
     }
@@ -1066,7 +1050,7 @@ mod tests {
         }
 
         match multipart.next().await {
-            None => (),
+            None => {}
             _ => unreachable!(),
         }
     }

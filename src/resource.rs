@@ -1,26 +1,26 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
-use actix_http::{Error, Extensions, Response};
+use actix_http::{Error, Extensions};
 use actix_router::IntoPattern;
 use actix_service::boxed::{self, BoxService, BoxServiceFactory};
 use actix_service::{
-    apply, apply_fn_factory, IntoServiceFactory, Service, ServiceFactory, Transform,
+    apply, apply_fn_factory, fn_service, IntoServiceFactory, Service, ServiceFactory,
+    ServiceFactoryExt, Transform,
 };
-use futures_util::future::{ok, Either, LocalBoxFuture, Ready};
+use futures_core::future::LocalBoxFuture;
+use futures_util::future::join_all;
 
-use crate::data::Data;
 use crate::dev::{insert_slash, AppService, HttpServiceFactory, ResourceDef};
 use crate::extract::FromRequest;
 use crate::guard::Guard;
 use crate::handler::Handler;
 use crate::responder::Responder;
-use crate::route::{CreateRouteService, Route, RouteService};
+use crate::route::{Route, RouteService};
 use crate::service::{ServiceRequest, ServiceResponse};
+use crate::{data::Data, HttpResponse};
 
 type HttpService = BoxService<ServiceRequest, ServiceResponse, Error>;
 type HttpNewService = BoxServiceFactory<(), ServiceRequest, ServiceResponse, Error, ()>;
@@ -35,7 +35,7 @@ type HttpNewService = BoxServiceFactory<(), ServiceRequest, ServiceResponse, Err
 /// and check guards for specific route, if request matches all
 /// guards, route considered matched and route handler get called.
 ///
-/// ```rust
+/// ```
 /// use actix_web::{web, App, HttpResponse};
 ///
 /// fn main() {
@@ -52,9 +52,9 @@ pub struct Resource<T = ResourceEndpoint> {
     rdef: Vec<String>,
     name: Option<String>,
     routes: Vec<Route>,
-    data: Option<Extensions>,
+    app_data: Option<Extensions>,
     guards: Vec<Box<dyn Guard>>,
-    default: Rc<RefCell<Option<Rc<HttpNewService>>>>,
+    default: HttpNewService,
     factory_ref: Rc<RefCell<Option<ResourceFactory>>>,
 }
 
@@ -69,8 +69,10 @@ impl Resource {
             endpoint: ResourceEndpoint::new(fref.clone()),
             factory_ref: fref,
             guards: Vec::new(),
-            data: None,
-            default: Rc::new(RefCell::new(None)),
+            app_data: None,
+            default: boxed::factory(fn_service(|req: ServiceRequest| async {
+                Ok(req.into_response(HttpResponse::MethodNotAllowed()))
+            })),
         }
     }
 }
@@ -78,8 +80,8 @@ impl Resource {
 impl<T> Resource<T>
 where
     T: ServiceFactory<
+        ServiceRequest,
         Config = (),
-        Request = ServiceRequest,
         Response = ServiceResponse,
         Error = Error,
         InitError = (),
@@ -95,7 +97,7 @@ where
 
     /// Add match guard to a resource.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::{web, guard, App, HttpResponse};
     ///
     /// async fn index(data: web::Path<(String, String)>) -> &'static str {
@@ -128,7 +130,7 @@ where
 
     /// Register a new route.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::{web, guard, App, HttpResponse};
     ///
     /// fn main() {
@@ -145,7 +147,7 @@ where
     /// Multiple routes could be added to a resource. Resource object uses
     /// match guards for route selection.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::{web, guard, App};
     ///
     /// fn main() {
@@ -170,7 +172,7 @@ where
     /// Provided data is available for all routes registered for the current resource.
     /// Resource data overrides data registered by `App::data()` method.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::{web, App, FromRequest};
     ///
     /// /// extract text data from request
@@ -200,16 +202,16 @@ where
     ///
     /// Data of different types from parent contexts will still be accessible.
     pub fn app_data<U: 'static>(mut self, data: U) -> Self {
-        if self.data.is_none() {
-            self.data = Some(Extensions::new());
-        }
-        self.data.as_mut().unwrap().insert(data);
+        self.app_data
+            .get_or_insert_with(Extensions::new)
+            .insert(data);
+
         self
     }
 
     /// Register a new route and add handler. This route matches all requests.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::*;
     ///
     /// fn index(req: HttpRequest) -> HttpResponse {
@@ -221,7 +223,7 @@ where
     ///
     /// This is shortcut for:
     ///
-    /// ```rust
+    /// ```
     /// # extern crate actix_web;
     /// # use actix_web::*;
     /// # fn index(req: HttpRequest) -> HttpResponse { unimplemented!() }
@@ -250,8 +252,8 @@ where
         mw: M,
     ) -> Resource<
         impl ServiceFactory<
+            ServiceRequest,
             Config = (),
-            Request = ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
@@ -260,7 +262,7 @@ where
     where
         M: Transform<
             T::Service,
-            Request = ServiceRequest,
+            ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
@@ -273,7 +275,7 @@ where
             guards: self.guards,
             routes: self.routes,
             default: self.default,
-            data: self.data,
+            app_data: self.app_data,
             factory_ref: self.factory_ref,
         }
     }
@@ -287,7 +289,7 @@ where
     /// Resource level middlewares are not allowed to change response
     /// type (i.e modify response's body).
     ///
-    /// ```rust
+    /// ```
     /// use actix_service::Service;
     /// use actix_web::{web, App};
     /// use actix_web::http::{header::CONTENT_TYPE, HeaderValue};
@@ -317,15 +319,15 @@ where
         mw: F,
     ) -> Resource<
         impl ServiceFactory<
+            ServiceRequest,
             Config = (),
-            Request = ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
         >,
     >
     where
-        F: FnMut(ServiceRequest, &mut T::Service) -> R + Clone,
+        F: Fn(ServiceRequest, &T::Service) -> R + Clone,
         R: Future<Output = Result<ServiceResponse, Error>>,
     {
         Resource {
@@ -335,7 +337,7 @@ where
             guards: self.guards,
             routes: self.routes,
             default: self.default,
-            data: self.data,
+            app_data: self.app_data,
             factory_ref: self.factory_ref,
         }
     }
@@ -345,21 +347,20 @@ where
     /// default handler from `App` or `Scope`.
     pub fn default_service<F, U>(mut self, f: F) -> Self
     where
-        F: IntoServiceFactory<U>,
+        F: IntoServiceFactory<U, ServiceRequest>,
         U: ServiceFactory<
+                ServiceRequest,
                 Config = (),
-                Request = ServiceRequest,
                 Response = ServiceResponse,
                 Error = Error,
             > + 'static,
         U::InitError: fmt::Debug,
     {
         // create and configure default resource
-        self.default = Rc::new(RefCell::new(Some(Rc::new(boxed::factory(
-            f.into_factory().map_init_err(|e| {
-                log::error!("Can not construct default service: {:?}", e)
-            }),
-        )))));
+        self.default = boxed::factory(
+            f.into_factory()
+                .map_init_err(|e| log::error!("Can not construct default service: {:?}", e)),
+        );
 
         self
     }
@@ -368,8 +369,8 @@ where
 impl<T> HttpServiceFactory for Resource<T>
 where
     T: ServiceFactory<
+            ServiceRequest,
             Config = (),
-            Request = ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
@@ -381,28 +382,26 @@ where
         } else {
             Some(std::mem::take(&mut self.guards))
         };
+
         let mut rdef = if config.is_root() || !self.rdef.is_empty() {
             ResourceDef::new(insert_slash(self.rdef.clone()))
         } else {
             ResourceDef::new(self.rdef.clone())
         };
+
         if let Some(ref name) = self.name {
             *rdef.name_mut() = name.clone();
-        }
-        // custom app data storage
-        if let Some(ref mut ext) = self.data {
-            config.set_service_data(ext);
         }
 
         config.register_service(rdef, guards, self, None)
     }
 }
 
-impl<T> IntoServiceFactory<T> for Resource<T>
+impl<T> IntoServiceFactory<T, ServiceRequest> for Resource<T>
 where
     T: ServiceFactory<
+        ServiceRequest,
         Config = (),
-        Request = ServiceRequest,
         Response = ServiceResponse,
         Error = Error,
         InitError = (),
@@ -411,7 +410,7 @@ where
     fn into_factory(self) -> T {
         *self.factory_ref.borrow_mut() = Some(ResourceFactory {
             routes: self.routes,
-            data: self.data.map(Rc::new),
+            app_data: self.app_data.map(Rc::new),
             default: self.default,
         });
 
@@ -421,139 +420,72 @@ where
 
 pub struct ResourceFactory {
     routes: Vec<Route>,
-    data: Option<Rc<Extensions>>,
-    default: Rc<RefCell<Option<Rc<HttpNewService>>>>,
+    app_data: Option<Rc<Extensions>>,
+    default: HttpNewService,
 }
 
-impl ServiceFactory for ResourceFactory {
-    type Config = ();
-    type Request = ServiceRequest;
+impl ServiceFactory<ServiceRequest> for ResourceFactory {
     type Response = ServiceResponse;
     type Error = Error;
-    type InitError = ();
+    type Config = ();
     type Service = ResourceService;
-    type Future = CreateResourceService;
+    type InitError = ();
+    type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
 
     fn new_service(&self, _: ()) -> Self::Future {
-        let default_fut = if let Some(ref default) = *self.default.borrow() {
-            Some(default.new_service(()))
-        } else {
-            None
-        };
+        // construct default service factory future.
+        let default_fut = self.default.new_service(());
 
-        CreateResourceService {
-            fut: self
-                .routes
-                .iter()
-                .map(|route| CreateRouteServiceItem::Future(route.new_service(())))
-                .collect(),
-            data: self.data.clone(),
-            default: None,
-            default_fut,
-        }
-    }
-}
+        // construct route service factory futures
+        let factory_fut = join_all(self.routes.iter().map(|route| route.new_service(())));
 
-enum CreateRouteServiceItem {
-    Future(CreateRouteService),
-    Service(RouteService),
-}
+        let app_data = self.app_data.clone();
 
-pub struct CreateResourceService {
-    fut: Vec<CreateRouteServiceItem>,
-    data: Option<Rc<Extensions>>,
-    default: Option<HttpService>,
-    default_fut: Option<LocalBoxFuture<'static, Result<HttpService, ()>>>,
-}
+        Box::pin(async move {
+            let default = default_fut.await?;
+            let routes = factory_fut
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
 
-impl Future for CreateResourceService {
-    type Output = Result<ResourceService, ()>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut done = true;
-
-        if let Some(ref mut fut) = self.default_fut {
-            match Pin::new(fut).poll(cx)? {
-                Poll::Ready(default) => self.default = Some(default),
-                Poll::Pending => done = false,
-            }
-        }
-
-        // poll http services
-        for item in &mut self.fut {
-            match item {
-                CreateRouteServiceItem::Future(ref mut fut) => match Pin::new(fut)
-                    .poll(cx)?
-                {
-                    Poll::Ready(route) => *item = CreateRouteServiceItem::Service(route),
-                    Poll::Pending => {
-                        done = false;
-                    }
-                },
-                CreateRouteServiceItem::Service(_) => continue,
-            };
-        }
-
-        if done {
-            let routes = self
-                .fut
-                .drain(..)
-                .map(|item| match item {
-                    CreateRouteServiceItem::Service(service) => service,
-                    CreateRouteServiceItem::Future(_) => unreachable!(),
-                })
-                .collect();
-            Poll::Ready(Ok(ResourceService {
+            Ok(ResourceService {
                 routes,
-                data: self.data.clone(),
-                default: self.default.take(),
-            }))
-        } else {
-            Poll::Pending
-        }
+                app_data,
+                default,
+            })
+        })
     }
 }
 
 pub struct ResourceService {
     routes: Vec<RouteService>,
-    data: Option<Rc<Extensions>>,
-    default: Option<HttpService>,
+    app_data: Option<Rc<Extensions>>,
+    default: HttpService,
 }
 
-impl Service for ResourceService {
-    type Request = ServiceRequest;
+impl Service<ServiceRequest> for ResourceService {
     type Response = ServiceResponse;
     type Error = Error;
-    type Future = Either<
-        Ready<Result<ServiceResponse, Error>>,
-        LocalBoxFuture<'static, Result<ServiceResponse, Error>>,
-    >;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    actix_service::always_ready!();
 
-    fn call(&mut self, mut req: ServiceRequest) -> Self::Future {
-        for route in self.routes.iter_mut() {
+    fn call(&self, mut req: ServiceRequest) -> Self::Future {
+        for route in self.routes.iter() {
             if route.check(&mut req) {
-                if let Some(ref data) = self.data {
-                    req.add_data_container(data.clone());
+                if let Some(ref app_data) = self.app_data {
+                    req.add_data_container(app_data.clone());
                 }
-                return Either::Right(route.call(req));
+
+                return route.call(req);
             }
         }
-        if let Some(ref mut default) = self.default {
-            if let Some(ref data) = self.data {
-                req.add_data_container(data.clone());
-            }
-            Either::Right(default.call(req))
-        } else {
-            let req = req.into_parts().0;
-            Either::Left(ok(ServiceResponse::new(
-                req,
-                Response::MethodNotAllowed().finish(),
-            )))
+
+        if let Some(ref app_data) = self.app_data {
+            req.add_data_container(app_data.clone());
         }
+
+        self.default.call(req)
     }
 }
 
@@ -568,17 +500,16 @@ impl ResourceEndpoint {
     }
 }
 
-impl ServiceFactory for ResourceEndpoint {
-    type Config = ();
-    type Request = ServiceRequest;
+impl ServiceFactory<ServiceRequest> for ResourceEndpoint {
     type Response = ServiceResponse;
     type Error = Error;
-    type InitError = ();
+    type Config = ();
     type Service = ResourceService;
-    type Future = CreateResourceService;
+    type InitError = ();
+    type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
 
     fn new_service(&self, _: ()) -> Self::Future {
-        self.factory.borrow_mut().as_mut().unwrap().new_service(())
+        self.factory.borrow().as_ref().unwrap().new_service(())
     }
 }
 
@@ -586,9 +517,9 @@ impl ServiceFactory for ResourceEndpoint {
 mod tests {
     use std::time::Duration;
 
-    use actix_rt::time::delay_for;
+    use actix_rt::time::sleep;
     use actix_service::Service;
-    use futures_util::future::ok;
+    use actix_utils::future::ok;
 
     use crate::http::{header, HeaderValue, Method, StatusCode};
     use crate::middleware::DefaultHeaders;
@@ -598,21 +529,20 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_middleware() {
-        let mut srv =
-            init_service(
-                App::new().service(
-                    web::resource("/test")
-                        .name("test")
-                        .wrap(DefaultHeaders::new().header(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("0001"),
-                        ))
-                        .route(web::get().to(HttpResponse::Ok)),
-                ),
-            )
-            .await;
+        let srv = init_service(
+            App::new().service(
+                web::resource("/test")
+                    .name("test")
+                    .wrap(
+                        DefaultHeaders::new()
+                            .header(header::CONTENT_TYPE, HeaderValue::from_static("0001")),
+                    )
+                    .route(web::get().to(HttpResponse::Ok)),
+            ),
+        )
+        .await;
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -622,7 +552,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_middleware_fn() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().service(
                 web::resource("/test")
                     .wrap_fn(|req, srv| {
@@ -642,7 +572,7 @@ mod tests {
         )
         .await;
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -652,20 +582,19 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_to() {
-        let mut srv =
-            init_service(App::new().service(web::resource("/test").to(|| async {
-                delay_for(Duration::from_millis(100)).await;
-                Ok::<_, Error>(HttpResponse::Ok())
-            })))
-            .await;
+        let srv = init_service(App::new().service(web::resource("/test").to(|| async {
+            sleep(Duration::from_millis(100)).await;
+            Ok::<_, Error>(HttpResponse::Ok())
+        })))
+        .await;
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_rt::test]
     async fn test_pattern() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().service(
                 web::resource(["/test", "/test2"])
                     .to(|| async { Ok::<_, Error>(HttpResponse::Ok()) }),
@@ -673,16 +602,16 @@ mod tests {
         )
         .await;
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let req = TestRequest::with_uri("/test2").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_rt::test]
     async fn test_default_resource() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new()
                 .service(web::resource("/test").route(web::get().to(HttpResponse::Ok)))
                 .default_service(|r: ServiceRequest| {
@@ -691,16 +620,16 @@ mod tests {
         )
         .await;
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let req = TestRequest::with_uri("/test")
             .method(Method::POST)
             .to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().service(
                 web::resource("/test")
                     .route(web::get().to(HttpResponse::Ok))
@@ -712,19 +641,19 @@ mod tests {
         .await;
 
         let req = TestRequest::with_uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let req = TestRequest::with_uri("/test")
             .method(Method::POST)
             .to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[actix_rt::test]
     async fn test_resource_guards() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new()
                 .service(
                     web::resource("/test/{p}")
@@ -747,25 +676,25 @@ mod tests {
         let req = TestRequest::with_uri("/test/it")
             .method(Method::GET)
             .to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let req = TestRequest::with_uri("/test/it")
             .method(Method::PUT)
             .to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let req = TestRequest::with_uri("/test/it")
             .method(Method::DELETE)
             .to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[actix_rt::test]
     async fn test_data() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new()
                 .data(1.0f64)
                 .data(1usize)
@@ -791,13 +720,13 @@ mod tests {
         .await;
 
         let req = TestRequest::get().uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_rt::test]
     async fn test_data_default_service() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().data(1usize).service(
                 web::resource("/test")
                     .data(10usize)
@@ -810,7 +739,7 @@ mod tests {
         .await;
 
         let req = TestRequest::get().uri("/test").to_request();
-        let resp = call_service(&mut srv, req).await;
+        let resp = call_service(&srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -1,8 +1,78 @@
 # Changes
 
-## Unreleased - 2020-xx-xx
+## Unreleased - 2021-xx-xx
+
+
+## 3.0.0-beta.5 - 2021-04-17
+### Removed
+* Deprecated methods on `ClientRequest`: `if_true`, `if_some`. [#2148]
+
+[#2148]: https://github.com/actix/actix-web/pull/2148
+
+
+## 3.0.0-beta.4 - 2021-04-02
+### Added
+* Add `Client::headers` to get default mut reference of `HeaderMap` of client object. [#2114]
+
 ### Changed
-* Bumped `rand` to `0.8`
+* `ConnectorService` type is renamed to `BoxConnectorService`. [#2081]
+* Fix http/https encoding when enabling `compress` feature. [#2116]
+* Rename `TestResponse::header` to `append_header`, `set` to `insert_header`. `TestResponse` header
+  methods now take `IntoHeaderPair` tuples. [#2094]
+
+[#2081]: https://github.com/actix/actix-web/pull/2081
+[#2094]: https://github.com/actix/actix-web/pull/2094
+[#2114]: https://github.com/actix/actix-web/pull/2114
+[#2116]: https://github.com/actix/actix-web/pull/2116
+
+
+## 3.0.0-beta.3 - 2021-03-08
+### Added
+* `ClientResponse::timeout` for set the timeout of collecting response body. [#1931]
+* `ClientBuilder::local_address` for bind to a local ip address for this client. [#2024]
+
+### Changed
+* Feature `cookies` is now optional and enabled by default. [#1981]
+* `ClientBuilder::connector` method would take `actix_http::client::Connector<T, U>` type. [#2008]
+* Basic auth password now takes blank passwords as an empty string instead of Option. [#2050]
+
+### Removed
+* `ClientBuilder::default` function [#2008]
+
+[#1931]: https://github.com/actix/actix-web/pull/1931
+[#1981]: https://github.com/actix/actix-web/pull/1981
+[#2008]: https://github.com/actix/actix-web/pull/2008
+[#2024]: https://github.com/actix/actix-web/pull/2024
+[#2050]: https://github.com/actix/actix-web/pull/2050
+
+
+## 3.0.0-beta.2 - 2021-02-10
+### Added
+* `ClientRequest::insert_header` method which allows using typed headers. [#1869]
+* `ClientRequest::append_header` method which allows using typed headers. [#1869]
+* `trust-dns` optional feature to enable `trust-dns-resolver` as client dns resolver. [#1969]
+
+### Changed
+* Relax default timeout for `Connector` to 5 seconds(original 1 second). [#1905]
+
+### Removed
+* `ClientRequest::set`; use `ClientRequest::insert_header`. [#1869]
+* `ClientRequest::set_header`; use `ClientRequest::insert_header`. [#1869]
+* `ClientRequest::set_header_if_none`; use `ClientRequest::insert_header_if_none`. [#1869]
+* `ClientRequest::header`; use `ClientRequest::append_header`. [#1869]
+
+[#1869]: https://github.com/actix/actix-web/pull/1869
+[#1905]: https://github.com/actix/actix-web/pull/1905
+[#1969]: https://github.com/actix/actix-web/pull/1969
+
+
+## 3.0.0-beta.1 - 2021-01-07
+### Changed
+* Update `rand` to `0.8`
+* Update `bytes` to `1.0`. [#1813]
+* Update `rust-tls` to `0.19`. [#1813]
+
+[#1813]: https://github.com/actix/actix-web/pull/1813
 
 
 ## 2.0.3 - 2020-11-29

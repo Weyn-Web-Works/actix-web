@@ -2,12 +2,12 @@
 //!
 //! ## Making a GET request
 //!
-//! ```rust
+//! ```no_run
 //! # #[actix_rt::main]
 //! # async fn main() -> Result<(), awc::error::SendRequestError> {
 //! let mut client = awc::Client::default();
 //! let response = client.get("http://www.rust-lang.org") // <- Create request builder
-//!     .header("User-Agent", "Actix-web")
+//!     .insert_header(("User-Agent", "Actix-web"))
 //!     .send()                                            // <- Send http request
 //!     .await?;
 //!
@@ -20,7 +20,7 @@
 //!
 //! ### Raw body contents
 //!
-//! ```rust
+//! ```no_run
 //! # #[actix_rt::main]
 //! # async fn main() -> Result<(), awc::error::SendRequestError> {
 //! let mut client = awc::Client::default();
@@ -33,7 +33,7 @@
 //!
 //! ### Forms
 //!
-//! ```rust
+//! ```no_run
 //! # #[actix_rt::main]
 //! # async fn main() -> Result<(), awc::error::SendRequestError> {
 //! let params = [("foo", "bar"), ("baz", "quux")];
@@ -48,7 +48,7 @@
 //!
 //! ### JSON
 //!
-//! ```rust
+//! ```no_run
 //! # #[actix_rt::main]
 //! # async fn main() -> Result<(), awc::error::SendRequestError> {
 //! let request = serde_json::json!({
@@ -66,7 +66,7 @@
 //!
 //! ## WebSocket support
 //!
-//! ```
+//! ```no_run
 //! # #[actix_rt::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use futures_util::{sink::SinkExt, stream::StreamExt};
@@ -76,7 +76,7 @@
 //!     .await?;
 //!
 //! connection
-//!     .send(awc::ws::Message::Text("Echo".to_string()))
+//!     .send(awc::ws::Message::Text("Echo".into()))
 //!     .await?;
 //! let response = connection.next().await.unwrap()?;
 //! # assert_eq!(response, awc::ws::Frame::Text("Echo".as_bytes().into()));
@@ -93,20 +93,26 @@
 #![doc(html_logo_url = "https://actix.rs/img/logo.png")]
 #![doc(html_favicon_url = "https://actix.rs/favicon.ico")]
 
-use std::cell::RefCell;
-use std::convert::TryFrom;
-use std::rc::Rc;
-use std::time::Duration;
+use std::{convert::TryFrom, rc::Rc, time::Duration};
 
-pub use actix_http::{client::Connector, cookie, http};
+#[cfg(feature = "cookies")]
+pub use cookie;
 
-use actix_http::http::{Error as HttpError, HeaderMap, Method, Uri};
-use actix_http::RequestHead;
+pub use actix_http::{client::Connector, http};
+
+use actix_http::{
+    client::{TcpConnect, TcpConnectError, TcpConnection},
+    http::{Error as HttpError, HeaderMap, Method, Uri},
+    RequestHead,
+};
+use actix_rt::net::TcpStream;
+use actix_service::Service;
 
 mod builder;
 mod connect;
 pub mod error;
 mod frozen;
+pub mod middleware;
 mod request;
 mod response;
 mod sender;
@@ -114,19 +120,17 @@ pub mod test;
 pub mod ws;
 
 pub use self::builder::ClientBuilder;
-pub use self::connect::BoxedSocket;
+pub use self::connect::{BoxConnectorService, BoxedSocket, ConnectRequest, ConnectResponse};
 pub use self::frozen::{FrozenClientRequest, FrozenSendBuilder};
 pub use self::request::ClientRequest;
 pub use self::response::{ClientResponse, JsonBody, MessageBody};
 pub use self::sender::SendClientRequest;
 
-use self::connect::{Connect, ConnectorWrapper};
-
 /// An asynchronous HTTP and WebSocket client.
 ///
 /// ## Examples
 ///
-/// ```rust
+/// ```
 /// use awc::Client;
 ///
 /// #[actix_rt::main]
@@ -134,31 +138,26 @@ use self::connect::{Connect, ConnectorWrapper};
 ///     let mut client = Client::default();
 ///
 ///     let res = client.get("http://www.rust-lang.org") // <- Create request builder
-///         .header("User-Agent", "Actix-web")
-///         .send()                             // <- Send http request
+///         .insert_header(("User-Agent", "Actix-web"))
+///         .send()                             // <- Send HTTP request
 ///         .await;                             // <- send request and wait for response
 ///
 ///      println!("Response: {:?}", res);
 /// }
 /// ```
 #[derive(Clone)]
-pub struct Client(Rc<ClientConfig>);
+pub struct Client(ClientConfig);
 
+#[derive(Clone)]
 pub(crate) struct ClientConfig {
-    pub(crate) connector: RefCell<Box<dyn Connect>>,
-    pub(crate) headers: HeaderMap,
+    pub(crate) connector: BoxConnectorService,
+    pub(crate) headers: Rc<HeaderMap>,
     pub(crate) timeout: Option<Duration>,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        Client(Rc::new(ClientConfig {
-            connector: RefCell::new(Box::new(ConnectorWrapper(
-                Connector::new().finish(),
-            ))),
-            headers: HeaderMap::new(),
-            timeout: Some(Duration::from_secs(5)),
-        }))
+        ClientBuilder::new().finish()
     }
 }
 
@@ -170,7 +169,13 @@ impl Client {
 
     /// Create `Client` builder.
     /// This function is equivalent of `ClientBuilder::new()`.
-    pub fn builder() -> ClientBuilder {
+    pub fn builder() -> ClientBuilder<
+        impl Service<
+                TcpConnect<Uri>,
+                Response = TcpConnection<Uri, TcpStream>,
+                Error = TcpConnectError,
+            > + Clone,
+    > {
         ClientBuilder::new()
     }
 
@@ -182,8 +187,8 @@ impl Client {
     {
         let mut req = ClientRequest::new(method, url, self.0.clone());
 
-        for (key, value) in self.0.headers.iter() {
-            req = req.set_header_if_none(key.clone(), value.clone());
+        for header in self.0.headers.iter() {
+            req = req.insert_header_if_none(header);
         }
         req
     }
@@ -198,8 +203,8 @@ impl Client {
         <Uri as TryFrom<U>>::Error: Into<HttpError>,
     {
         let mut req = self.request(head.method.clone(), url);
-        for (key, value) in head.headers.iter() {
-            req = req.set_header_if_none(key.clone(), value.clone());
+        for header in head.headers.iter() {
+            req = req.insert_header_if_none(header);
         }
         req
     }
@@ -279,5 +284,13 @@ impl Client {
             req.head.headers.insert(key.clone(), value.clone());
         }
         req
+    }
+
+    /// Get default HeaderMap of Client.
+    ///
+    /// Returns Some(&mut HeaderMap) when Client object is unique
+    /// (No other clone of client exists at the same time).
+    pub fn headers(&mut self) -> Option<&mut HeaderMap> {
+        Rc::get_mut(&mut self.0.headers)
     }
 }

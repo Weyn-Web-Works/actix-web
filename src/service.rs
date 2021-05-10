@@ -2,24 +2,35 @@ use std::cell::{Ref, RefMut};
 use std::rc::Rc;
 use std::{fmt, net};
 
-use actix_http::body::{Body, MessageBody, ResponseBody};
+use actix_http::body::{Body, MessageBody};
 use actix_http::http::{HeaderMap, Method, StatusCode, Uri, Version};
 use actix_http::{
-    Error, Extensions, HttpMessage, Payload, PayloadStream, RequestHead, Response,
-    ResponseHead,
+    Error, Extensions, HttpMessage, Payload, PayloadStream, RequestHead, Response, ResponseHead,
 };
 use actix_router::{IntoPattern, Path, Resource, ResourceDef, Url};
 use actix_service::{IntoServiceFactory, ServiceFactory};
+#[cfg(feature = "cookies")]
+use cookie::{Cookie, ParseError as CookieParseError};
 
-use crate::config::{AppConfig, AppService};
 use crate::dev::insert_slash;
 use crate::guard::Guard;
 use crate::info::ConnectionInfo;
 use crate::request::HttpRequest;
 use crate::rmap::ResourceMap;
+use crate::{
+    config::{AppConfig, AppService},
+    HttpResponse,
+};
 
 pub trait HttpServiceFactory {
     fn register(self, config: &mut AppService);
+}
+
+impl<T: HttpServiceFactory> HttpServiceFactory for Vec<T> {
+    fn register(self, config: &mut AppService) {
+        self.into_iter()
+            .for_each(|factory| factory.register(config));
+    }
 }
 
 pub(crate) trait AppServiceFactory {
@@ -52,71 +63,68 @@ where
 /// An service http request
 ///
 /// ServiceRequest allows mutable access to request's internal structures
-pub struct ServiceRequest(HttpRequest);
+pub struct ServiceRequest {
+    req: HttpRequest,
+    payload: Payload,
+}
 
 impl ServiceRequest {
     /// Construct service request
-    pub(crate) fn new(req: HttpRequest) -> Self {
-        ServiceRequest(req)
+    pub(crate) fn new(req: HttpRequest, payload: Payload) -> Self {
+        Self { req, payload }
+    }
+
+    /// Construct service request.
+    #[doc(hidden)]
+    pub fn __priv_test_new(req: HttpRequest, payload: Payload) -> Self {
+        Self::new(req, payload)
     }
 
     /// Deconstruct request into parts
-    pub fn into_parts(mut self) -> (HttpRequest, Payload) {
-        let pl = Rc::get_mut(&mut (self.0).0).unwrap().payload.take();
-        (self.0, pl)
+    #[inline]
+    pub fn into_parts(self) -> (HttpRequest, Payload) {
+        (self.req, self.payload)
     }
 
     /// Construct request from parts.
-    ///
-    /// `ServiceRequest` can be re-constructed only if `req` hasn't been cloned.
-    pub fn from_parts(
-        mut req: HttpRequest,
-        pl: Payload,
-    ) -> Result<Self, (HttpRequest, Payload)> {
-        if Rc::strong_count(&req.0) == 1 && Rc::weak_count(&req.0) == 0 {
-            Rc::get_mut(&mut req.0).unwrap().payload = pl;
-            Ok(ServiceRequest(req))
-        } else {
-            Err((req, pl))
-        }
+    pub fn from_parts(req: HttpRequest, payload: Payload) -> Self {
+        Self { req, payload }
     }
 
     /// Construct request from request.
     ///
-    /// `HttpRequest` implements `Clone` trait via `Rc` type. `ServiceRequest`
-    /// can be re-constructed only if rc's strong pointers count eq 1 and
-    /// weak pointers count is 0.
-    pub fn from_request(req: HttpRequest) -> Result<Self, HttpRequest> {
-        if Rc::strong_count(&req.0) == 1 && Rc::weak_count(&req.0) == 0 {
-            Ok(ServiceRequest(req))
-        } else {
-            Err(req)
+    /// The returned `ServiceRequest` would have no payload.
+    pub fn from_request(req: HttpRequest) -> Self {
+        ServiceRequest {
+            req,
+            payload: Payload::None,
         }
     }
 
     /// Create service response
     #[inline]
     pub fn into_response<B, R: Into<Response<B>>>(self, res: R) -> ServiceResponse<B> {
-        ServiceResponse::new(self.0, res.into())
+        let res = HttpResponse::from(res.into());
+        ServiceResponse::new(self.req, res)
     }
 
     /// Create service response for error
     #[inline]
-    pub fn error_response<B, E: Into<Error>>(self, err: E) -> ServiceResponse<B> {
-        let res: Response = err.into().into();
-        ServiceResponse::new(self.0, res.into_body())
+    pub fn error_response<E: Into<Error>>(self, err: E) -> ServiceResponse {
+        let res = HttpResponse::from_error(err.into());
+        ServiceResponse::new(self.req, res)
     }
 
     /// This method returns reference to the request head
     #[inline]
     pub fn head(&self) -> &RequestHead {
-        &self.0.head()
+        &self.req.head()
     }
 
     /// This method returns reference to the request head
     #[inline]
     pub fn head_mut(&mut self) -> &mut RequestHead {
-        self.0.head_mut()
+        self.req.head_mut()
     }
 
     /// Request's uri.
@@ -167,12 +175,14 @@ impl ServiceRequest {
         }
     }
 
-    /// Peer socket address
+    /// Peer socket address.
     ///
-    /// Peer address is actual socket address, if proxy is used in front of
-    /// actix http server, then peer address would be address of this proxy.
+    /// Peer address is the directly connected peer's socket address. If a proxy is used in front of
+    /// the Actix Web server, then it would be address of this proxy.
     ///
     /// To get client connection information `ConnectionInfo` should be used.
+    ///
+    /// Will only return None when called in unit tests.
     #[inline]
     pub fn peer_addr(&self) -> Option<net::SocketAddr> {
         self.head().peer_addr
@@ -192,42 +202,42 @@ impl ServiceRequest {
     /// access the matched value for that segment.
     #[inline]
     pub fn match_info(&self) -> &Path<Url> {
-        self.0.match_info()
+        self.req.match_info()
     }
 
     /// Counterpart to [`HttpRequest::match_name`](super::HttpRequest::match_name()).
     #[inline]
     pub fn match_name(&self) -> Option<&str> {
-        self.0.match_name()
+        self.req.match_name()
     }
 
     /// Counterpart to [`HttpRequest::match_pattern`](super::HttpRequest::match_pattern()).
     #[inline]
     pub fn match_pattern(&self) -> Option<String> {
-        self.0.match_pattern()
+        self.req.match_pattern()
     }
 
     #[inline]
     /// Get a mutable reference to the Path parameters.
     pub fn match_info_mut(&mut self) -> &mut Path<Url> {
-        self.0.match_info_mut()
+        self.req.match_info_mut()
     }
 
     #[inline]
     /// Get a reference to a `ResourceMap` of current application.
     pub fn resource_map(&self) -> &ResourceMap {
-        self.0.resource_map()
+        self.req.resource_map()
     }
 
     /// Service configuration
     #[inline]
     pub fn app_config(&self) -> &AppConfig {
-        self.0.app_config()
+        self.req.app_config()
     }
 
     /// Counterpart to [`HttpRequest::app_data`](super::HttpRequest::app_data()).
     pub fn app_data<T: 'static>(&self) -> Option<&T> {
-        for container in (self.0).0.app_data.iter().rev() {
+        for container in self.req.inner.app_data.iter().rev() {
             if let Some(data) = container.get::<T>() {
                 return Some(data);
             }
@@ -236,15 +246,28 @@ impl ServiceRequest {
         None
     }
 
-    /// Set request payload.
-    pub fn set_payload(&mut self, payload: Payload) {
-        Rc::get_mut(&mut (self.0).0).unwrap().payload = payload;
+    #[cfg(feature = "cookies")]
+    pub fn cookies(&self) -> Result<Ref<'_, Vec<Cookie<'static>>>, CookieParseError> {
+        self.req.cookies()
     }
 
-    #[doc(hidden)]
-    /// Add app data container to request's resolution set.
+    /// Return request cookie.
+    #[cfg(feature = "cookies")]
+    pub fn cookie(&self, name: &str) -> Option<Cookie<'static>> {
+        self.req.cookie(name)
+    }
+
+    /// Set request payload.
+    pub fn set_payload(&mut self, payload: Payload) {
+        self.payload = payload;
+    }
+
+    /// Add data container to request's resolution set.
+    ///
+    /// In middleware, prefer [`extensions_mut`](ServiceRequest::extensions_mut) for request-local
+    /// data since it is assumed that the same app data is presented for every request.
     pub fn add_data_container(&mut self, extensions: Rc<Extensions>) {
-        Rc::get_mut(&mut (self.0).0)
+        Rc::get_mut(&mut (self.req).inner)
             .unwrap()
             .app_data
             .push(extensions);
@@ -269,18 +292,18 @@ impl HttpMessage for ServiceRequest {
     /// Request extensions
     #[inline]
     fn extensions(&self) -> Ref<'_, Extensions> {
-        self.0.extensions()
+        self.req.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
     fn extensions_mut(&self) -> RefMut<'_, Extensions> {
-        self.0.extensions_mut()
+        self.req.extensions_mut()
     }
 
     #[inline]
     fn take_payload(&mut self) -> Payload<Self::Stream> {
-        Rc::get_mut(&mut (self.0).0).unwrap().payload.take()
+        self.payload.take()
     }
 }
 
@@ -309,34 +332,32 @@ impl fmt::Debug for ServiceRequest {
 
 pub struct ServiceResponse<B = Body> {
     request: HttpRequest,
-    response: Response<B>,
+    response: HttpResponse<B>,
+}
+
+impl ServiceResponse<Body> {
+    /// Create service response from the error
+    pub fn from_err<E: Into<Error>>(err: E, request: HttpRequest) -> Self {
+        let response = HttpResponse::from_error(err.into());
+        ServiceResponse { request, response }
+    }
 }
 
 impl<B> ServiceResponse<B> {
     /// Create service response instance
-    pub fn new(request: HttpRequest, response: Response<B>) -> Self {
+    pub fn new(request: HttpRequest, response: HttpResponse<B>) -> Self {
         ServiceResponse { request, response }
-    }
-
-    /// Create service response from the error
-    pub fn from_err<E: Into<Error>>(err: E, request: HttpRequest) -> Self {
-        let e: Error = err.into();
-        let res: Response = e.into();
-        ServiceResponse {
-            request,
-            response: res.into_body(),
-        }
     }
 
     /// Create service response for error
     #[inline]
-    pub fn error_response<E: Into<Error>>(self, err: E) -> Self {
-        Self::from_err(err, self.request)
+    pub fn error_response<E: Into<Error>>(self, err: E) -> ServiceResponse {
+        ServiceResponse::from_err(err, self.request)
     }
 
     /// Create service response
     #[inline]
-    pub fn into_response<B1>(self, response: Response<B1>) -> ServiceResponse<B1> {
+    pub fn into_response<B1>(self, response: HttpResponse<B1>) -> ServiceResponse<B1> {
         ServiceResponse::new(self.request, response)
     }
 
@@ -348,13 +369,13 @@ impl<B> ServiceResponse<B> {
 
     /// Get reference to response
     #[inline]
-    pub fn response(&self) -> &Response<B> {
+    pub fn response(&self) -> &HttpResponse<B> {
         &self.response
     }
 
     /// Get mutable reference to response
     #[inline]
-    pub fn response_mut(&mut self) -> &mut Response<B> {
+    pub fn response_mut(&mut self) -> &mut HttpResponse<B> {
         &mut self.response
     }
 
@@ -370,30 +391,25 @@ impl<B> ServiceResponse<B> {
         self.response.headers()
     }
 
-    #[inline]
     /// Returns mutable response's headers.
+    #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         self.response.headers_mut()
     }
 
     /// Execute closure and in case of error convert it to response.
-    pub fn checked_expr<F, E>(mut self, f: F) -> Self
+    pub fn checked_expr<F, E>(mut self, f: F) -> Result<Self, Error>
     where
         F: FnOnce(&mut Self) -> Result<(), E>,
         E: Into<Error>,
     {
-        match f(&mut self) {
-            Ok(_) => self,
-            Err(err) => {
-                let res: Response = err.into().into();
-                ServiceResponse::new(self.request, res.into_body())
-            }
-        }
+        f(&mut self).map_err(Into::into)?;
+        Ok(self)
     }
 
     /// Extract response body
-    pub fn take_body(&mut self) -> ResponseBody<B> {
-        self.response.take_body()
+    pub fn into_body(self) -> B {
+        self.response.into_body()
     }
 }
 
@@ -401,7 +417,7 @@ impl<B> ServiceResponse<B> {
     /// Set a new body
     pub fn map_body<F, B2>(self, f: F) -> ServiceResponse<B2>
     where
-        F: FnOnce(&mut ResponseHead, ResponseBody<B>) -> ResponseBody<B2>,
+        F: FnOnce(&mut ResponseHead, B) -> B2,
     {
         let response = self.response.map_body(f);
 
@@ -412,13 +428,23 @@ impl<B> ServiceResponse<B> {
     }
 }
 
-impl<B> Into<Response<B>> for ServiceResponse<B> {
-    fn into(self) -> Response<B> {
-        self.response
+impl<B> From<ServiceResponse<B>> for HttpResponse<B> {
+    fn from(res: ServiceResponse<B>) -> HttpResponse<B> {
+        res.response
     }
 }
 
-impl<B: MessageBody> fmt::Debug for ServiceResponse<B> {
+impl<B> From<ServiceResponse<B>> for Response<B> {
+    fn from(res: ServiceResponse<B>) -> Response<B> {
+        res.response.into()
+    }
+}
+
+impl<B> fmt::Debug for ServiceResponse<B>
+where
+    B: MessageBody,
+    B::Error: Into<Error>,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let res = writeln!(
             f,
@@ -462,7 +488,7 @@ impl WebService {
 
     /// Add match guard to a web service.
     ///
-    /// ```rust
+    /// ```
     /// use actix_web::{web, guard, dev, App, Error, HttpResponse};
     ///
     /// async fn index(req: dev::ServiceRequest) -> Result<dev::ServiceResponse, Error> {
@@ -486,10 +512,10 @@ impl WebService {
     /// Set a service factory implementation and generate web service.
     pub fn finish<T, F>(self, service: F) -> impl HttpServiceFactory
     where
-        F: IntoServiceFactory<T>,
+        F: IntoServiceFactory<T, ServiceRequest>,
         T: ServiceFactory<
+                ServiceRequest,
                 Config = (),
-                Request = ServiceRequest,
                 Response = ServiceResponse,
                 Error = Error,
                 InitError = (),
@@ -514,8 +540,8 @@ struct WebServiceImpl<T> {
 impl<T> HttpServiceFactory for WebServiceImpl<T>
 where
     T: ServiceFactory<
+            ServiceRequest,
             Config = (),
-            Request = ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
@@ -540,38 +566,73 @@ where
     }
 }
 
+/// Macro helping register different types of services at the sametime.
+///
+/// The service type must be implementing [`HttpServiceFactory`](self::HttpServiceFactory) trait.
+///
+/// The max number of services can be grouped together is 12.
+///
+/// # Examples
+///
+/// ```
+/// use actix_web::{services, web, App};
+///
+/// let services = services![
+///     web::resource("/test2").to(|| async { "test2" }),
+///     web::scope("/test3").route("/", web::get().to(|| async { "test3" }))
+/// ];
+///
+/// let app = App::new().service(services);
+///
+/// // services macro just convert multiple services to a tuple.
+/// // below would also work without importing the macro.
+/// let app = App::new().service((
+///     web::resource("/test2").to(|| async { "test2" }),
+///     web::scope("/test3").route("/", web::get().to(|| async { "test3" }))
+/// ));
+/// ```
+#[macro_export]
+macro_rules! services {
+    ($($x:expr),+ $(,)?) => {
+        ($($x,)+)
+    }
+}
+
+/// HttpServiceFactory trait impl for tuples
+macro_rules! service_tuple ({ $($T:ident)+ } => {
+    impl<$($T: HttpServiceFactory),+> HttpServiceFactory for ($($T,)+) {
+        #[allow(non_snake_case)]
+        fn register(self, config: &mut AppService) {
+            let ($($T,)*) = self;
+            $($T.register(config);)+
+        }
+    }
+});
+
+service_tuple! { A }
+service_tuple! { A B }
+service_tuple! { A B C }
+service_tuple! { A B C D }
+service_tuple! { A B C D E }
+service_tuple! { A B C D E F }
+service_tuple! { A B C D E F G }
+service_tuple! { A B C D E F G H }
+service_tuple! { A B C D E F G H I }
+service_tuple! { A B C D E F G H I J }
+service_tuple! { A B C D E F G H I J K }
+service_tuple! { A B C D E F G H I J K L }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test::{init_service, TestRequest};
     use crate::{guard, http, web, App, HttpResponse};
     use actix_service::Service;
-    use futures_util::future::ok;
-
-    #[test]
-    fn test_service_request() {
-        let req = TestRequest::default().to_srv_request();
-        let (r, pl) = req.into_parts();
-        assert!(ServiceRequest::from_parts(r, pl).is_ok());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, pl) = req.into_parts();
-        let _r2 = r.clone();
-        assert!(ServiceRequest::from_parts(r, pl).is_err());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, _pl) = req.into_parts();
-        assert!(ServiceRequest::from_request(r).is_ok());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, _pl) = req.into_parts();
-        let _r2 = r.clone();
-        assert!(ServiceRequest::from_request(r).is_err());
-    }
+    use actix_utils::future::ok;
 
     #[actix_rt::test]
     async fn test_service() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().service(web::service("/test").name("test").finish(
                 |req: ServiceRequest| ok(req.into_response(HttpResponse::Ok().finish())),
             )),
@@ -581,7 +642,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::OK);
 
-        let mut srv = init_service(
+        let srv = init_service(
             App::new().service(web::service("/test").guard(guard::Get()).finish(
                 |req: ServiceRequest| ok(req.into_response(HttpResponse::Ok().finish())),
             )),
@@ -596,20 +657,18 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_service_data() {
-        let mut srv = init_service(
-            App::new()
-                .data(42u32)
-                .service(web::service("/test").name("test").finish(
-                    |req: ServiceRequest| {
-                        assert_eq!(
-                            req.app_data::<web::Data<u32>>().unwrap().as_ref(),
-                            &42
-                        );
-                        ok(req.into_response(HttpResponse::Ok().finish()))
-                    },
-                )),
-        )
-        .await;
+        let srv =
+            init_service(
+                App::new()
+                    .data(42u32)
+                    .service(web::service("/test").name("test").finish(
+                        |req: ServiceRequest| {
+                            assert_eq!(req.app_data::<web::Data<u32>>().unwrap().as_ref(), &42);
+                            ok(req.into_response(HttpResponse::Ok().finish()))
+                        },
+                    )),
+            )
+            .await;
         let req = TestRequest::with_uri("/test").to_request();
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -619,14 +678,14 @@ mod tests {
     fn test_fmt_debug() {
         let req = TestRequest::get()
             .uri("/index.html?test=1")
-            .header("x-test", "111")
+            .insert_header(("x-test", "111"))
             .to_srv_request();
         let s = format!("{:?}", req);
         assert!(s.contains("ServiceRequest"));
         assert!(s.contains("test=1"));
         assert!(s.contains("x-test"));
 
-        let res = HttpResponse::Ok().header("x-test", "111").finish();
+        let res = HttpResponse::Ok().insert_header(("x-test", "111")).finish();
         let res = TestRequest::post()
             .uri("/index.html?test=1")
             .to_srv_response(res);
@@ -634,5 +693,81 @@ mod tests {
         let s = format!("{:?}", res);
         assert!(s.contains("ServiceResponse"));
         assert!(s.contains("x-test"));
+    }
+
+    #[actix_rt::test]
+    async fn test_services_macro() {
+        let scoped = services![
+            web::service("/scoped_test1").name("scoped_test1").finish(
+                |req: ServiceRequest| async {
+                    Ok(req.into_response(HttpResponse::Ok().finish()))
+                }
+            ),
+            web::resource("/scoped_test2").to(|| async { "test2" }),
+        ];
+
+        let services = services![
+            web::service("/test1")
+                .name("test")
+                .finish(|req: ServiceRequest| async {
+                    Ok(req.into_response(HttpResponse::Ok().finish()))
+                }),
+            web::resource("/test2").to(|| async { "test2" }),
+            web::scope("/test3").service(scoped)
+        ];
+
+        let srv = init_service(App::new().service(services)).await;
+
+        let req = TestRequest::with_uri("/test1").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test2").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test3/scoped_test1").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test3/scoped_test2").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn test_services_vec() {
+        let services = vec![
+            web::resource("/test1").to(|| async { "test1" }),
+            web::resource("/test2").to(|| async { "test2" }),
+        ];
+
+        let scoped = vec![
+            web::resource("/scoped_test1").to(|| async { "test1" }),
+            web::resource("/scoped_test2").to(|| async { "test2" }),
+        ];
+
+        let srv = init_service(
+            App::new()
+                .service(services)
+                .service(web::scope("/test3").service(scoped)),
+        )
+        .await;
+
+        let req = TestRequest::with_uri("/test1").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test2").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test3/scoped_test1").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let req = TestRequest::with_uri("/test3/scoped_test2").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
     }
 }

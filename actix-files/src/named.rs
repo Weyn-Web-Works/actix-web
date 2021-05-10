@@ -1,3 +1,6 @@
+use actix_service::{Service, ServiceFactory};
+use actix_utils::future::{ok, ready, Ready};
+use actix_web::dev::{AppService, HttpServiceFactory, ResourceDef};
 use std::fs::{File, Metadata};
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -8,18 +11,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::MetadataExt;
 
 use actix_web::{
-    dev::{BodyEncoding, SizedStream},
+    dev::{BodyEncoding, ServiceRequest, ServiceResponse, SizedStream},
     http::{
         header::{
-            self, Charset, ContentDisposition, DispositionParam, DispositionType,
-            ExtendedValue,
+            self, Charset, ContentDisposition, DispositionParam, DispositionType, ExtendedValue,
         },
         ContentEncoding, StatusCode,
     },
     Error, HttpMessage, HttpRequest, HttpResponse, Responder,
 };
 use bitflags::bitflags;
-use futures_util::future::{ready, Ready};
 use mime_guess::from_path;
 
 use crate::ChunkedReadFile;
@@ -41,6 +42,29 @@ impl Default for Flags {
 }
 
 /// A file with an associated name.
+///
+/// `NamedFile` can be registered as services:
+/// ```
+/// use actix_web::App;
+/// use actix_files::NamedFile;
+///
+/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let app = App::new()
+///     .service(NamedFile::open("./static/index.html")?);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// They can also be returned from handlers:
+/// ```
+/// use actix_web::{Responder, get};
+/// use actix_files::NamedFile;
+///
+/// #[get("/")]
+/// async fn index() -> impl Responder {
+///     NamedFile::open("./static/index.html")
+/// }
+/// ```
 #[derive(Debug)]
 pub struct NamedFile {
     path: PathBuf,
@@ -62,7 +86,7 @@ impl NamedFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use actix_files::NamedFile;
     /// use std::io::{self, Write};
     /// use std::env;
@@ -139,7 +163,7 @@ impl NamedFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use actix_files::NamedFile;
     ///
     /// let file = NamedFile::open("foo.txt");
@@ -158,7 +182,7 @@ impl NamedFile {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// # use std::io;
     /// use actix_files::NamedFile;
     ///
@@ -277,37 +301,31 @@ impl NamedFile {
     }
 
     /// Creates an `HttpResponse` with file as a streaming body.
-    pub fn into_response(self, req: &HttpRequest) -> Result<HttpResponse, Error> {
+    pub fn into_response(self, req: &HttpRequest) -> HttpResponse {
         if self.status_code != StatusCode::OK {
             let mut res = HttpResponse::build(self.status_code);
 
             if self.flags.contains(Flags::PREFER_UTF8) {
                 let ct = equiv_utf8_text(self.content_type.clone());
-                res.header(header::CONTENT_TYPE, ct.to_string());
+                res.insert_header((header::CONTENT_TYPE, ct.to_string()));
             } else {
-                res.header(header::CONTENT_TYPE, self.content_type.to_string());
+                res.insert_header((header::CONTENT_TYPE, self.content_type.to_string()));
             }
 
             if self.flags.contains(Flags::CONTENT_DISPOSITION) {
-                res.header(
+                res.insert_header((
                     header::CONTENT_DISPOSITION,
                     self.content_disposition.to_string(),
-                );
+                ));
             }
 
             if let Some(current_encoding) = self.encoding {
                 res.encoding(current_encoding);
             }
 
-            let reader = ChunkedReadFile {
-                size: self.md.len(),
-                offset: 0,
-                file: Some(self.file),
-                fut: None,
-                counter: 0,
-            };
+            let reader = ChunkedReadFile::new(self.md.len(), 0, self.file);
 
-            return Ok(res.streaming(reader));
+            return res.streaming(reader);
         }
 
         let etag = if self.flags.contains(Flags::ETAG) {
@@ -332,7 +350,7 @@ impl NamedFile {
             let t2: SystemTime = since.clone().into();
 
             match (t1.duration_since(UNIX_EPOCH), t2.duration_since(UNIX_EPOCH)) {
-                (Ok(t1), Ok(t2)) => t1 > t2,
+                (Ok(t1), Ok(t2)) => t1.as_secs() > t2.as_secs(),
                 _ => false,
             }
         } else {
@@ -351,7 +369,7 @@ impl NamedFile {
             let t2: SystemTime = since.clone().into();
 
             match (t1.duration_since(UNIX_EPOCH), t2.duration_since(UNIX_EPOCH)) {
-                (Ok(t1), Ok(t2)) => t1 <= t2,
+                (Ok(t1), Ok(t2)) => t1.as_secs() <= t2.as_secs(),
                 _ => false,
             }
         } else {
@@ -362,16 +380,16 @@ impl NamedFile {
 
         if self.flags.contains(Flags::PREFER_UTF8) {
             let ct = equiv_utf8_text(self.content_type.clone());
-            resp.header(header::CONTENT_TYPE, ct.to_string());
+            resp.insert_header((header::CONTENT_TYPE, ct.to_string()));
         } else {
-            resp.header(header::CONTENT_TYPE, self.content_type.to_string());
+            resp.insert_header((header::CONTENT_TYPE, self.content_type.to_string()));
         }
 
         if self.flags.contains(Flags::CONTENT_DISPOSITION) {
-            resp.header(
+            resp.insert_header((
                 header::CONTENT_DISPOSITION,
                 self.content_disposition.to_string(),
-            );
+            ));
         }
 
         // default compressing
@@ -380,14 +398,14 @@ impl NamedFile {
         }
 
         if let Some(lm) = last_modified {
-            resp.header(header::LAST_MODIFIED, lm.to_string());
+            resp.insert_header((header::LAST_MODIFIED, lm.to_string()));
         }
 
         if let Some(etag) = etag {
-            resp.header(header::ETAG, etag.to_string());
+            resp.insert_header((header::ETAG, etag.to_string()));
         }
 
-        resp.header(header::ACCEPT_RANGES, "bytes");
+        resp.insert_header((header::ACCEPT_RANGES, "bytes"));
 
         let mut length = self.md.len();
         let mut offset = 0;
@@ -400,43 +418,32 @@ impl NamedFile {
                     offset = ranges[0].start;
 
                     resp.encoding(ContentEncoding::Identity);
-                    resp.header(
+                    resp.insert_header((
                         header::CONTENT_RANGE,
-                        format!(
-                            "bytes {}-{}/{}",
-                            offset,
-                            offset + length - 1,
-                            self.md.len()
-                        ),
-                    );
+                        format!("bytes {}-{}/{}", offset, offset + length - 1, self.md.len()),
+                    ));
                 } else {
-                    resp.header(header::CONTENT_RANGE, format!("bytes */{}", length));
-                    return Ok(resp.status(StatusCode::RANGE_NOT_SATISFIABLE).finish());
+                    resp.insert_header((header::CONTENT_RANGE, format!("bytes */{}", length)));
+                    return resp.status(StatusCode::RANGE_NOT_SATISFIABLE).finish();
                 };
             } else {
-                return Ok(resp.status(StatusCode::BAD_REQUEST).finish());
+                return resp.status(StatusCode::BAD_REQUEST).finish();
             };
         };
 
         if precondition_failed {
-            return Ok(resp.status(StatusCode::PRECONDITION_FAILED).finish());
+            return resp.status(StatusCode::PRECONDITION_FAILED).finish();
         } else if not_modified {
-            return Ok(resp.status(StatusCode::NOT_MODIFIED).finish());
+            return resp.status(StatusCode::NOT_MODIFIED).finish();
         }
 
-        let reader = ChunkedReadFile {
-            offset,
-            size: length,
-            file: Some(self.file),
-            fut: None,
-            counter: 0,
-        };
+        let reader = ChunkedReadFile::new(length, offset, self.file);
 
         if offset != 0 || length != self.md.len() {
             resp.status(StatusCode::PARTIAL_CONTENT);
         }
 
-        Ok(resp.body(SizedStream::new(length, reader)))
+        resp.body(SizedStream::new(length, reader))
     }
 }
 
@@ -495,10 +502,57 @@ fn none_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
 }
 
 impl Responder for NamedFile {
-    type Error = Error;
-    type Future = Ready<Result<HttpResponse, Error>>;
+    fn respond_to(self, req: &HttpRequest) -> HttpResponse {
+        self.into_response(req)
+    }
+}
 
-    fn respond_to(self, req: &HttpRequest) -> Self::Future {
-        ready(self.into_response(req))
+impl ServiceFactory<ServiceRequest> for NamedFile {
+    type Response = ServiceResponse;
+    type Error = Error;
+    type Config = ();
+    type InitError = ();
+    type Service = NamedFileService;
+    type Future = Ready<Result<Self::Service, ()>>;
+
+    fn new_service(&self, _: ()) -> Self::Future {
+        ok(NamedFileService {
+            path: self.path.clone(),
+        })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct NamedFileService {
+    path: PathBuf,
+}
+
+impl Service<ServiceRequest> for NamedFileService {
+    type Response = ServiceResponse;
+    type Error = Error;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    actix_service::always_ready!();
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let (req, _) = req.into_parts();
+        ready(
+            NamedFile::open(&self.path)
+                .map_err(|e| e.into())
+                .map(|f| f.into_response(&req))
+                .map(|res| ServiceResponse::new(req, res)),
+        )
+    }
+}
+
+impl HttpServiceFactory for NamedFile {
+    fn register(self, config: &mut AppService) {
+        config.register_service(
+            ResourceDef::root_prefix(self.path.to_string_lossy().as_ref()),
+            None,
+            self,
+            None,
+        )
     }
 }

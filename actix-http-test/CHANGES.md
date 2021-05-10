@@ -1,6 +1,26 @@
 # Changes
 
-## Unreleased - 2020-xx-xx
+## Unreleased - 2021-xx-xx
+
+
+## 3.0.0-beta.4 - 2021-04-02
+* Added `TestServer::client_headers` method. [#2097]
+
+[#2097]: https://github.com/actix/actix-web/pull/2097
+
+
+## 3.0.0-beta.3 - 2021-03-09
+* No notable changes.
+
+
+## 3.0.0-beta.2 - 2021-02-10
+* No notable changes.
+
+
+## 3.0.0-beta.1 - 2021-01-07
+* Update `bytes` to `1.0`. [#1813]
+
+[#1813]: https://github.com/actix/actix-web/pull/1813
 
 
 ## 2.1.0 - 2020-11-25

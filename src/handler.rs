@@ -3,20 +3,23 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use actix_http::{Error, Response};
+use actix_http::Error;
 use actix_service::{Service, ServiceFactory};
-use futures_util::future::{ready, Ready};
-use futures_util::ready;
+use actix_utils::future::{ready, Ready};
+use futures_core::ready;
 use pin_project::pin_project;
 
-use crate::extract::FromRequest;
-use crate::request::HttpRequest;
-use crate::responder::Responder;
-use crate::service::{ServiceRequest, ServiceResponse};
+use crate::{
+    extract::FromRequest,
+    request::HttpRequest,
+    responder::Responder,
+    response::HttpResponse,
+    service::{ServiceRequest, ServiceResponse},
+};
 
-///  A request handler is an async function that accepts zero or more parameters that can be
-///  extracted from a request (ie, [`impl FromRequest`](crate::FromRequest)) and returns a type that can be converted into
-///  an [`HttpResponse`](crate::HttpResponse) (ie, [`impl Responder`](crate::Responder)).
+/// A request handler is an async function that accepts zero or more parameters that can be
+/// extracted from a request (i.e., [`impl FromRequest`](crate::FromRequest)) and returns a type
+/// that can be converted into an [`HttpResponse`] (that is, it impls the [`Responder`] trait).
 ///
 /// If you got the error `the trait Handler<_, _, _> is not implemented`, then your function is not
 /// a valid handler. See [Request Handlers](https://actix.rs/docs/handlers/) for more information.
@@ -26,17 +29,6 @@ where
     R::Output: Responder,
 {
     fn call(&self, param: T) -> R;
-}
-
-impl<F, R> Handler<(), R> for F
-where
-    F: Fn() -> R + Clone + 'static,
-    R: Future,
-    R::Output: Responder,
-{
-    fn call(&self, _: ()) -> R {
-        (self)()
-    }
 }
 
 #[doc(hidden)]
@@ -49,7 +41,7 @@ where
     R::Output: Responder,
 {
     hnd: F,
-    _t: PhantomData<(T, R)>,
+    _phantom: PhantomData<(T, R)>,
 }
 
 impl<F, T, R> HandlerService<F, T, R>
@@ -62,7 +54,7 @@ where
     pub fn new(hnd: F) -> Self {
         Self {
             hnd,
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
@@ -77,19 +69,18 @@ where
     fn clone(&self) -> Self {
         Self {
             hnd: self.hnd.clone(),
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<F, T, R> ServiceFactory for HandlerService<F, T, R>
+impl<F, T, R> ServiceFactory<ServiceRequest> for HandlerService<F, T, R>
 where
     F: Handler<T, R>,
     T: FromRequest,
     R: Future,
     R::Output: Responder,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
     type Config = ();
@@ -102,24 +93,21 @@ where
     }
 }
 
-// Handler is both it's ServiceHandler and Service Type.
-impl<F, T, R> Service for HandlerService<F, T, R>
+/// HandlerService is both it's ServiceFactory and Service Type.
+impl<F, T, R> Service<ServiceRequest> for HandlerService<F, T, R>
 where
     F: Handler<T, R>,
     T: FromRequest,
     R: Future,
     R::Output: Responder,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse;
     type Error = Error;
     type Future = HandlerServiceFuture<F, T, R>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    actix_service::always_ready!();
 
-    fn call(&mut self, req: Self::Request) -> Self::Future {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
         let (req, mut payload) = req.into_parts();
         let fut = T::from_request(&req, &mut payload);
         HandlerServiceFuture::Extract(fut, Some(req), self.hnd.clone())
@@ -137,7 +125,6 @@ where
 {
     Extract(#[pin] T::Future, Option<HttpRequest>, F),
     Handle(#[pin] R, Option<HttpRequest>),
-    Respond(#[pin] <R::Output as Responder>::Future, Option<HttpRequest>),
 }
 
 impl<F, T, R> Future for HandlerServiceFuture<F, T, R>
@@ -161,22 +148,17 @@ where
                             let state = HandlerServiceFuture::Handle(fut, req.take());
                             self.as_mut().set(state);
                         }
-                        Err(e) => {
-                            let res: Response = e.into().into();
+                        Err(err) => {
                             let req = req.take().unwrap();
+                            let res = HttpResponse::from_error(err.into());
                             return Poll::Ready(Ok(ServiceResponse::new(req, res)));
                         }
                     };
                 }
                 HandlerProj::Handle(fut, req) => {
                     let res = ready!(fut.poll(cx));
-                    let fut = res.respond_to(req.as_ref().unwrap());
-                    let state = HandlerServiceFuture::Respond(fut, req.take());
-                    self.as_mut().set(state);
-                }
-                HandlerProj::Respond(fut, req) => {
-                    let res = ready!(fut.poll(cx)).unwrap_or_else(|e| e.into().into());
                     let req = req.take().unwrap();
+                    let res = res.respond_to(&req);
                     return Poll::Ready(Ok(ServiceResponse::new(req, res)));
                 }
             }
@@ -185,30 +167,29 @@ where
 }
 
 /// FromRequest trait impl for tuples
-macro_rules! factory_tuple ({ $(($n:tt, $T:ident)),+} => {
-    impl<Func, $($T,)+ Res> Handler<($($T,)+), Res> for Func
-    where Func: Fn($($T,)+) -> Res + Clone + 'static,
+macro_rules! factory_tuple ({ $($param:ident)* } => {
+    impl<Func, $($param,)* Res> Handler<($($param,)*), Res> for Func
+    where Func: Fn($($param),*) -> Res + Clone + 'static,
           Res: Future,
           Res::Output: Responder,
     {
-        fn call(&self, param: ($($T,)+)) -> Res {
-            (self)($(param.$n,)+)
+        #[allow(non_snake_case)]
+        fn call(&self, ($($param,)*): ($($param,)*)) -> Res {
+            (self)($($param,)*)
         }
     }
 });
 
-#[rustfmt::skip]
-mod m {
-    use super::*;
-
-    factory_tuple!((0, A));
-    factory_tuple!((0, A), (1, B));
-    factory_tuple!((0, A), (1, B), (2, C));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E), (5, F));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G), (7, H));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G), (7, H), (8, I));
-    factory_tuple!((0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G), (7, H), (8, I), (9, J));
-}
+factory_tuple! {}
+factory_tuple! { A }
+factory_tuple! { A B }
+factory_tuple! { A B C }
+factory_tuple! { A B C D }
+factory_tuple! { A B C D E }
+factory_tuple! { A B C D E F }
+factory_tuple! { A B C D E F G }
+factory_tuple! { A B C D E F G H }
+factory_tuple! { A B C D E F G H I }
+factory_tuple! { A B C D E F G H I J }
+factory_tuple! { A B C D E F G H I J K }
+factory_tuple! { A B C D E F G H I J K L }

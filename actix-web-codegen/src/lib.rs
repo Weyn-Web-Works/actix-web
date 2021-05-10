@@ -1,6 +1,6 @@
-//! Macros for reducing boilerplate code in Actix Web applications.
+//! Routing and runtime macros for Actix Web.
 //!
-//! ## Actix Web Re-exports
+//! # Actix Web Re-exports
 //! Actix Web re-exports a version of this crate in it's entirety so you usually don't have to
 //! specify a dependency on this crate explicitly. Sometimes, however, updates are made to this
 //! crate before the actix-web dependency is updated. Therefore, code examples here will show
@@ -10,7 +10,7 @@
 //! # Runtime Setup
 //! Used for setting up the actix async runtime. See [macro@main] macro docs.
 //!
-//! ```rust
+//! ```
 //! #[actix_web_codegen::main] // or `#[actix_web::main]` in Actix Web apps
 //! async fn main() {
 //!     async { println!("Hello world"); }.await
@@ -23,7 +23,7 @@
 //!
 //! See docs for: [GET], [POST], [PATCH], [PUT], [DELETE], [HEAD], [CONNECT], [OPTIONS], [TRACE]
 //!
-//! ```rust
+//! ```
 //! # use actix_web::HttpResponse;
 //! # use actix_web_codegen::get;
 //! #[get("/test")]
@@ -36,7 +36,7 @@
 //! Similar to the single method handler macro but takes one or more arguments for the HTTP methods
 //! it should respond to. See [macro@route] macro docs.
 //!
-//! ```rust
+//! ```
 //! # use actix_web::HttpResponse;
 //! # use actix_web_codegen::route;
 //! #[route("/test", method="GET", method="HEAD")]
@@ -71,6 +71,7 @@ mod route;
 ///
 /// # Attributes
 /// - `"path"` - Raw literal string with path for which to register handler.
+/// - `name="resource_name"` - Specifies resource name for the handler. If not set, the function name of handler is used.
 /// - `method="HTTP_METHOD"` - Registers HTTP method to provide guard for. Upper-case string, "GET", "POST" for example.
 /// - `guard="function_name"` - Registers function as guard using `actix_web::guard::fn_guard`
 /// - `wrap="Middleware"` - Registers a resource middleware.
@@ -81,7 +82,7 @@ mod route;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```
 /// # use actix_web::HttpResponse;
 /// # use actix_web_codegen::route;
 /// #[route("/test", method="GET", method="HEAD")]
@@ -116,6 +117,7 @@ Creates route handler with `actix_web::guard::", stringify!($variant), "`.
 
 # Attributes
 - `"path"` - Raw literal string with path for which to register handler.
+- `name="resource_name"` - Specifies resource name for the handler. If not set, the function name of handler is used.
 - `guard="function_name"` - Registers function as guard using `actix_web::guard::fn_guard`.
 - `wrap="Middleware"` - Registers a resource middleware.
 
@@ -125,7 +127,7 @@ code, e.g `my_guard` or `my_module::my_guard`.
 
 # Example
 
-```rust
+```
 # use actix_web::HttpResponse;
 # use actix_web_codegen::"#, stringify!($method), ";
 #[", stringify!($method), r#"("/")]
@@ -159,8 +161,8 @@ method_macro! {
 /// # Actix Web Re-export
 /// This macro can be applied with `#[actix_web::main]` when used in Actix Web applications.
 ///
-/// # Usage
-/// ```rust
+/// # Examples
+/// ```
 /// #[actix_web_codegen::main]
 /// async fn main() {
 ///     async { println!("Hello world"); }.await
@@ -175,7 +177,6 @@ pub fn main(_: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &input.vis;
     let sig = &mut input.sig;
     let body = &input.block;
-    let name = &sig.ident;
 
     if sig.asyncness.is_none() {
         return syn::Error::new_spanned(sig.fn_token, "only async fn is supported")
@@ -188,7 +189,7 @@ pub fn main(_: TokenStream, item: TokenStream) -> TokenStream {
     (quote! {
         #(#attrs)*
         #vis #sig {
-            actix_web::rt::System::new(stringify!(#name))
+            actix_web::rt::System::new()
                 .block_on(async move { #body })
         }
     })

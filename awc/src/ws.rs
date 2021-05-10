@@ -4,9 +4,9 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```no_run
 //! use awc::{Client, ws};
-//! use futures_util::{sink::SinkExt, stream::StreamExt};
+//! use futures_util::{sink::SinkExt as _, stream::StreamExt as _};
 //!
 //! #[actix_rt::main]
 //! async fn main() {
@@ -17,7 +17,7 @@
 //!         .unwrap();
 //!
 //!     connection
-//!         .send(ws::Message::Text("Echo".to_string()))
+//!         .send(ws::Message::Text("Echo".into()))
 //!         .await
 //!         .unwrap();
 //!     let response = connection.next().await.unwrap().unwrap();
@@ -28,28 +28,25 @@
 
 use std::convert::TryFrom;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::{fmt, str};
 
 use actix_codec::Framed;
-use actix_http::cookie::{Cookie, CookieJar};
 use actix_http::{ws, Payload, RequestHead};
 use actix_rt::time::timeout;
+use actix_service::Service;
 
 pub use actix_http::ws::{CloseCode, CloseReason, Codec, Frame, Message};
 
-use crate::connect::BoxedSocket;
+use crate::connect::{BoxedSocket, ConnectRequest};
+#[cfg(feature = "cookies")]
+use crate::cookie::{Cookie, CookieJar};
 use crate::error::{InvalidUrl, SendRequestError, WsClientError};
-use crate::http::header::{
-    self, HeaderName, HeaderValue, IntoHeaderValue, AUTHORIZATION,
-};
-use crate::http::{
-    ConnectionType, Error as HttpError, Method, StatusCode, Uri, Version,
-};
+use crate::http::header::{self, HeaderName, HeaderValue, IntoHeaderValue, AUTHORIZATION};
+use crate::http::{ConnectionType, Error as HttpError, Method, StatusCode, Uri, Version};
 use crate::response::ClientResponse;
 use crate::ClientConfig;
 
-/// `WebSocket` connection
+/// WebSocket connection.
 pub struct WebsocketsRequest {
     pub(crate) head: RequestHead,
     err: Option<HttpError>,
@@ -58,13 +55,15 @@ pub struct WebsocketsRequest {
     addr: Option<SocketAddr>,
     max_size: usize,
     server_mode: bool,
+    config: ClientConfig,
+
+    #[cfg(feature = "cookies")]
     cookies: Option<CookieJar>,
-    config: Rc<ClientConfig>,
 }
 
 impl WebsocketsRequest {
-    /// Create new websocket connection
-    pub(crate) fn new<U>(uri: U, config: Rc<ClientConfig>) -> Self
+    /// Create new WebSocket connection
+    pub(crate) fn new<U>(uri: U, config: ClientConfig) -> Self
     where
         Uri: TryFrom<U>,
         <Uri as TryFrom<U>>::Error: Into<HttpError>,
@@ -93,6 +92,7 @@ impl WebsocketsRequest {
             protocols: None,
             max_size: 65_536,
             server_mode: false,
+            #[cfg(feature = "cookies")]
             cookies: None,
         }
     }
@@ -106,7 +106,7 @@ impl WebsocketsRequest {
         self
     }
 
-    /// Set supported websocket protocols
+    /// Set supported WebSocket protocols
     pub fn protocols<U, V>(mut self, protos: U) -> Self
     where
         U: IntoIterator<Item = V>,
@@ -121,6 +121,7 @@ impl WebsocketsRequest {
     }
 
     /// Set a cookie
+    #[cfg(feature = "cookies")]
     pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
         if self.cookies.is_none() {
             let mut jar = CookieJar::new();
@@ -147,7 +148,7 @@ impl WebsocketsRequest {
 
     /// Set max frame size
     ///
-    /// By default max size is set to 64kb
+    /// By default max size is set to 64kB
     pub fn max_frame_size(mut self, size: usize) -> Self {
         self.max_size = size;
         self
@@ -170,7 +171,7 @@ impl WebsocketsRequest {
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into() {
+            Ok(key) => match value.try_into_value() {
                 Ok(value) => {
                     self.head.headers.append(key, value);
                 }
@@ -189,7 +190,7 @@ impl WebsocketsRequest {
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into() {
+            Ok(key) => match value.try_into_value() {
                 Ok(value) => {
                     self.head.headers.insert(key, value);
                 }
@@ -210,7 +211,7 @@ impl WebsocketsRequest {
         match HeaderName::try_from(key) {
             Ok(key) => {
                 if !self.head.headers.contains_key(&key) {
-                    match value.try_into() {
+                    match value.try_into_value() {
                         Ok(value) => {
                             self.head.headers.insert(key, value);
                         }
@@ -243,7 +244,7 @@ impl WebsocketsRequest {
         self.header(AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    /// Complete request construction and connect to a websockets server.
+    /// Complete request construction and connect to a WebSocket server.
     pub async fn connect(
         mut self,
     ) -> Result<(ClientResponse, Framed<BoxedSocket, Codec>), WsClientError> {
@@ -259,7 +260,7 @@ impl WebsocketsRequest {
             return Err(InvalidUrl::MissingScheme.into());
         } else if let Some(scheme) = uri.scheme() {
             match scheme.as_str() {
-                "http" | "ws" | "https" | "wss" => (),
+                "http" | "ws" | "https" | "wss" => {}
                 _ => return Err(InvalidUrl::UnknownScheme.into()),
             }
         } else {
@@ -274,11 +275,12 @@ impl WebsocketsRequest {
         }
 
         // set cookies
+        #[cfg(feature = "cookies")]
         if let Some(ref mut jar) = self.cookies {
             let cookie: String = jar
                 .delta()
                 // ensure only name=value is written to cookie header
-                .map(|c| Cookie::new(c.name(), c.value()).encoded().to_string())
+                .map(|c| c.stripped().encoded().to_string())
                 .collect::<Vec<_>>()
                 .join("; ");
 
@@ -325,28 +327,27 @@ impl WebsocketsRequest {
         let max_size = self.max_size;
         let server_mode = self.server_mode;
 
-        let fut = self
-            .config
-            .connector
-            .borrow_mut()
-            .open_tunnel(head, self.addr);
+        let req = ConnectRequest::Tunnel(head, self.addr);
+
+        let fut = self.config.connector.call(req);
 
         // set request timeout
-        let (head, framed) = if let Some(to) = self.config.timeout {
+        let res = if let Some(to) = self.config.timeout {
             timeout(to, fut)
                 .await
-                .map_err(|_| SendRequestError::Timeout)
-                .and_then(|res| res)?
+                .map_err(|_| SendRequestError::Timeout)??
         } else {
             fut.await?
         };
+
+        let (head, framed) = res.into_tunnel_response();
 
         // verify response
         if head.status != StatusCode::SWITCHING_PROTOCOLS {
             return Err(WsClientError::InvalidResponseStatus(head.status));
         }
 
-        // Check for "UPGRADE" to websocket header
+        // check for "UPGRADE" to WebSocket header
         let has_hdr = if let Some(hdr) = head.headers.get(&header::UPGRADE) {
             if let Ok(s) = hdr.to_str() {
                 s.to_ascii_lowercase().contains("websocket")
@@ -379,12 +380,14 @@ impl WebsocketsRequest {
 
         if let Some(hdr_key) = head.headers.get(&header::SEC_WEBSOCKET_ACCEPT) {
             let encoded = ws::hash_key(key.as_ref());
-            if hdr_key.as_bytes() != encoded.as_bytes() {
+
+            if hdr_key.as_bytes() != encoded {
                 log::trace!(
-                    "Invalid challenge response: expected: {} received: {:?}",
-                    encoded,
+                    "Invalid challenge response: expected: {:?} received: {:?}",
+                    &encoded,
                     key
                 );
+
                 return Err(WsClientError::InvalidChallengeResponse(
                     encoded,
                     hdr_key.clone(),

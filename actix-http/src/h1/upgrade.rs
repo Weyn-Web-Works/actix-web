@@ -1,41 +1,34 @@
-use std::marker::PhantomData;
-use std::task::{Context, Poll};
-
 use actix_codec::Framed;
 use actix_service::{Service, ServiceFactory};
-use futures_util::future::{ready, Ready};
+use futures_core::future::LocalBoxFuture;
 
 use crate::error::Error;
 use crate::h1::Codec;
 use crate::request::Request;
 
-pub struct UpgradeHandler<T>(pub(crate) PhantomData<T>);
+pub struct UpgradeHandler;
 
-impl<T> ServiceFactory for UpgradeHandler<T> {
-    type Config = ();
-    type Request = (Request, Framed<T, Codec>);
+impl<T> ServiceFactory<(Request, Framed<T, Codec>)> for UpgradeHandler {
     type Response = ();
     type Error = Error;
-    type Service = UpgradeHandler<T>;
+    type Config = ();
+    type Service = UpgradeHandler;
     type InitError = Error;
-    type Future = Ready<Result<Self::Service, Self::InitError>>;
+    type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
 
     fn new_service(&self, _: ()) -> Self::Future {
         unimplemented!()
     }
 }
 
-impl<T> Service for UpgradeHandler<T> {
-    type Request = (Request, Framed<T, Codec>);
+impl<T> Service<(Request, Framed<T, Codec>)> for UpgradeHandler {
     type Response = ();
     type Error = Error;
-    type Future = Ready<Result<Self::Response, Self::Error>>;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    actix_service::always_ready!();
 
-    fn call(&mut self, _: Self::Request) -> Self::Future {
-        ready(Ok(()))
+    fn call(&self, _: (Request, Framed<T, Codec>)) -> Self::Future {
+        unimplemented!()
     }
 }

@@ -1,16 +1,144 @@
 # Changes
 
-## Unreleased - 2020-xx-xx
+## Unreleased - 2021-xx-xx
+### Added
+* `HttpServer::worker_max_blocking_threads` for setting block thread pool. [#2200]
+
 ### Changed
-* Bumped `rand` to `0.8`
+* `ServiceResponse::error_response` now uses body type of `Body`. [#2201]
+* `ServiceResponse::checked_expr` now returns a `Result`. [#2201]
+* Update `language-tags` to `0.3`.
+* `ServiceResponse::take_body`. [#2201]
+* `ServiceResponse::map_body` closure receives and returns `B` instead of `ResponseBody<B>` types. [#2201]
+
+### Removed
+* `HttpResponse::take_body` and old `HttpResponse::into_body` method that casted body type. [#2201]
+
+[#2200]: https://github.com/actix/actix-web/pull/2200
+[#2201]: https://github.com/actix/actix-web/pull/2201
+
+
+## 4.0.0-beta.6 - 2021-04-17
+### Added
+* `HttpResponse` and `HttpResponseBuilder` structs. [#2065]
+
+### Changed
+* Most error types are now marked `#[non_exhaustive]`. [#2148]
+* Methods on `ContentDisposition` that took `T: AsRef<str>` now take `impl AsRef<str>`.
+
+[#2065]: https://github.com/actix/actix-web/pull/2065
+[#2148]: https://github.com/actix/actix-web/pull/2148
+
+
+## 4.0.0-beta.5 - 2021-04-02
+### Added
+* `Header` extractor for extracting common HTTP headers in handlers. [#2094]
+* Added `TestServer::client_headers` method. [#2097]
+
+### Fixed
+* Double ampersand in Logger format is escaped correctly. [#2067]
+
+### Changed
+* `CustomResponder` would return error as `HttpResponse` when `CustomResponder::with_header` failed
+  instead of skipping. (Only the first error is kept when multiple error occur) [#2093]
+
+### Removed
+* The `client` mod was removed. Clients should now use `awc` directly.
+  [871ca5e4](https://github.com/actix/actix-web/commit/871ca5e4ae2bdc22d1ea02701c2992fa8d04aed7)
+* Integration testing was moved to new `actix-test` crate. Namely these items from the `test`
+  module: `TestServer`, `TestServerConfig`, `start`, `start_with`, and `unused_addr`. [#2112]
+
+[#2067]: https://github.com/actix/actix-web/pull/2067
+[#2093]: https://github.com/actix/actix-web/pull/2093
+[#2094]: https://github.com/actix/actix-web/pull/2094
+[#2097]: https://github.com/actix/actix-web/pull/2097
+[#2112]: https://github.com/actix/actix-web/pull/2112
+
+
+## 4.0.0-beta.4 - 2021-03-09
+### Changed
+* Feature `cookies` is now optional and enabled by default. [#1981]
+* `JsonBody::new` returns a default limit of 32kB to be consistent with `JsonConfig` and the default
+  behaviour of the `web::Json<T>` extractor. [#2010]
+
+[#1981]: https://github.com/actix/actix-web/pull/1981
+[#2010]: https://github.com/actix/actix-web/pull/2010
+
+
+## 4.0.0-beta.3 - 2021-02-10
+* Update `actix-web-codegen` to `0.5.0-beta.1`.
+
+
+## 4.0.0-beta.2 - 2021-02-10
+### Added
+* The method `Either<web::Json<T>, web::Form<T>>::into_inner()` which returns the inner type for
+  whichever variant was created. Also works for `Either<web::Form<T>, web::Json<T>>`. [#1894]
+* Add `services!` macro for helping register multiple services to `App`. [#1933]
+* Enable registering a vec of services of the same type to `App` [#1933]
+
+### Changed
+* Rework `Responder` trait to be sync and returns `Response`/`HttpResponse` directly.
+  Making it simpler and more performant. [#1891]
+* `ServiceRequest::into_parts` and `ServiceRequest::from_parts` can no longer fail. [#1893]
+* `ServiceRequest::from_request` can no longer fail. [#1893]
+* Our `Either` type now uses `Left`/`Right` variants (instead of `A`/`B`) [#1894]
+* `test::{call_service, read_response, read_response_json, send_request}` take `&Service`
+  in argument [#1905]
+* `App::wrap_fn`, `Resource::wrap_fn` and `Scope::wrap_fn` provide `&Service` in closure
+  argument. [#1905]
+* `web::block` no longer requires the output is a Result. [#1957]
+
+### Fixed
+* Multiple calls to `App::data` with the same type now keeps the latest call's data. [#1906]
+
+### Removed
+* Public field of `web::Path` has been made private. [#1894]
+* Public field of `web::Query` has been made private. [#1894]
+* `TestRequest::with_header`; use `TestRequest::default().insert_header()`. [#1869]
+* `AppService::set_service_data`; for custom HTTP service factories adding application data, use the
+  layered data model by calling `ServiceRequest::add_data_container` when handling
+  requests instead. [#1906]
+
+[#1891]: https://github.com/actix/actix-web/pull/1891
+[#1893]: https://github.com/actix/actix-web/pull/1893
+[#1894]: https://github.com/actix/actix-web/pull/1894
+[#1869]: https://github.com/actix/actix-web/pull/1869
+[#1905]: https://github.com/actix/actix-web/pull/1905
+[#1906]: https://github.com/actix/actix-web/pull/1906
+[#1933]: https://github.com/actix/actix-web/pull/1933
+[#1957]: https://github.com/actix/actix-web/pull/1957
+
+
+## 4.0.0-beta.1 - 2021-01-07
+### Added
+* `Compat` middleware enabling generic response body/error type of middlewares like `Logger` and
+  `Compress` to be used in `middleware::Condition` and `Resource`, `Scope` services. [#1865]
+
+### Changed
+* Update `actix-*` dependencies to tokio `1.0` based versions. [#1813]
+* Bumped `rand` to `0.8`.
+* Update `rust-tls` to `0.19`. [#1813]
 * Rename `Handler` to `HandlerService` and rename `Factory` to `Handler`. [#1852]
+* The default `TrailingSlash` is now `Trim`, in line with existing documentation. See migration
+  guide for implications. [#1875]
+* Rename `DefaultHeaders::{content_type => add_content_type}`. [#1875]
 * MSRV is now 1.46.0.
 
 ### Fixed
-* added the actual parsing error to `test::read_body_json` [#1812]
+* Added the underlying parse error to `test::read_body_json`'s panic message. [#1812]
+
+### Removed
+* Public modules `middleware::{normalize, err_handlers}`. All necessary middleware structs are now
+  exposed directly by the `middleware` module.
+* Remove `actix-threadpool` as dependency. `actix_threadpool::BlockingError` error type can be imported 
+  from `actix_web::error` module. [#1878]
 
 [#1812]: https://github.com/actix/actix-web/pull/1812
+[#1813]: https://github.com/actix/actix-web/pull/1813
 [#1852]: https://github.com/actix/actix-web/pull/1852
+[#1865]: https://github.com/actix/actix-web/pull/1865
+[#1875]: https://github.com/actix/actix-web/pull/1875
+[#1878]: https://github.com/actix/actix-web/pull/1878
 
 ## 3.3.2 - 2020-12-01
 ### Fixed
@@ -95,7 +223,7 @@
 
 ## 3.0.0-beta.4 - 2020-09-09
 ### Added
-* `middleware::NormalizePath` now has configurable behaviour for either always having a trailing
+* `middleware::NormalizePath` now has configurable behavior for either always having a trailing 
   slash, or as the new addition, always trimming trailing slashes. [#1639]
 
 ### Changed
@@ -423,7 +551,7 @@
 
 ## [1.0.0-rc] - 2019-05-18
 
-### Add
+### Added
 
 * Add `Query<T>::from_query()` to extract parameters from a query string. #846
 * `QueryConfig`, similar to `JsonConfig` for customizing error handling of query extractors.
@@ -439,7 +567,7 @@
 
 ## [1.0.0-beta.4] - 2019-05-12
 
-### Add
+### Added
 
 * Allow to set/override app data on scope level
 
@@ -465,7 +593,7 @@
 
 * CORS handling without headers #702
 
-* Allow to construct `Data` instances to avoid double `Arc` for `Send + Sync` types.
+* Allow constructing `Data` instances to avoid double `Arc` for `Send + Sync` types.
 
 ### Fixed
 
@@ -529,7 +657,7 @@
 
 ### Changed
 
-* Allow to use any service as default service.
+* Allow using any service as default service.
 
 * Remove generic type for request payload, always use default.
 
@@ -592,13 +720,13 @@
 
 ### Added
 
-* rustls support
+* Rustls support
 
 ### Changed
 
-* use forked cookie
+* Use forked cookie
 
-* multipart::Field renamed to MultipartField
+* Multipart::Field renamed to MultipartField
 
 ## [1.0.0-alpha.1] - 2019-03-28
 

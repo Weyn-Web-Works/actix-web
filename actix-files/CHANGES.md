@@ -1,7 +1,37 @@
 # Changes
 
-## Unreleased - 2020-xx-xx
+## Unreleased - 2021-xx-xx
+* `NamedFile` now implements `ServiceFactory` and `HttpServiceFactory` making it much more useful in routing. For example, it can be used directly as a default service. [#2135]
+* For symbolic links, `Content-Disposition` header no longer shows the filename of the original file. [#2156]
+
+[#2135]: https://github.com/actix/actix-web/pull/2135
+[#2156]: https://github.com/actix/actix-web/pull/2156
+
+
+## 0.6.0-beta.4 - 2021-04-02
+* No notable changes.
+
+* Add support for `.guard` in `Files` to selectively filter `Files` services. [#2046]
+
+[#2046]: https://github.com/actix/actix-web/pull/2046
+
+## 0.6.0-beta.3 - 2021-03-09
+* No notable changes.
+
+
+## 0.6.0-beta.2 - 2021-02-10
+* Fix If-Modified-Since and If-Unmodified-Since to not compare using sub-second timestamps. [#1887]
+* Replace `v_htmlescape` with `askama_escape`. [#1953]
+
+[#1887]: https://github.com/actix/actix-web/pull/1887
+[#1953]: https://github.com/actix/actix-web/pull/1953
+
+
+## 0.6.0-beta.1 - 2021-01-07
 * `HttpRange::parse` now has its own error type.
+* Update `bytes` to `1.0`. [#1813]
+
+[#1813]: https://github.com/actix/actix-web/pull/1813
 
 
 ## 0.5.0 - 2020-12-26

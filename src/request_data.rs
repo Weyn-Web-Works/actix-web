@@ -1,7 +1,7 @@
 use std::{any::type_name, ops::Deref};
 
 use actix_http::error::{Error, ErrorInternalServerError};
-use futures_util::future;
+use actix_utils::future::{err, ok, Ready};
 
 use crate::{dev::Payload, FromRequest, HttpRequest};
 
@@ -23,7 +23,7 @@ use crate::{dev::Payload, FromRequest, HttpRequest};
 /// provided to make this potential foot-gun more obvious.
 ///
 /// # Example
-/// ```rust,no_run
+/// ```no_run
 /// # use actix_web::{web, HttpResponse, HttpRequest, Responder};
 ///
 /// #[derive(Debug, Clone, PartialEq)]
@@ -67,11 +67,11 @@ impl<T: Clone + 'static> Deref for ReqData<T> {
 impl<T: Clone + 'static> FromRequest for ReqData<T> {
     type Config = ();
     type Error = Error;
-    type Future = future::Ready<Result<Self, Error>>;
+    type Future = Ready<Result<Self, Error>>;
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         if let Some(st) = req.extensions().get::<T>() {
-            future::ok(ReqData(st.clone()))
+            ok(ReqData(st.clone()))
         } else {
             log::debug!(
                 "Failed to construct App-level ReqData extractor. \
@@ -79,7 +79,7 @@ impl<T: Clone + 'static> FromRequest for ReqData<T> {
                 req.path(),
                 type_name::<T>(),
             );
-            future::err(ErrorInternalServerError(
+            err(ErrorInternalServerError(
                 "Missing expected request extension data",
             ))
         }
@@ -102,7 +102,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn req_data_extractor() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new()
                 .wrap_fn(|req, srv| {
                     if req.method() == Method::POST {
@@ -142,7 +142,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn req_data_internal_mutability() {
-        let mut srv = init_service(
+        let srv = init_service(
             App::new()
                 .wrap_fn(|req, srv| {
                     let data_before = Rc::new(RefCell::new(42u32));

@@ -3,16 +3,17 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use actix_codec::{AsyncRead, AsyncWrite, Framed};
 use actix_http::{body, h1, ws, Error, HttpService, Request, Response};
 use actix_http_test::test_server;
 use actix_service::{fn_factory, Service};
-use actix_utils::dispatcher::Dispatcher;
+use actix_utils::future;
 use bytes::Bytes;
-use futures_util::future;
-use futures_util::task::{Context, Poll};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt as _, StreamExt as _};
+
+use crate::ws::Dispatcher;
 
 struct WsService<T>(Arc<Mutex<(PhantomData<T>, Cell<bool>)>>);
 
@@ -21,7 +22,7 @@ impl<T> WsService<T> {
         WsService(Arc::new(Mutex::new((PhantomData, Cell::new(false)))))
     }
 
-    fn set_polled(&mut self) {
+    fn set_polled(&self) {
         *self.0.lock().unwrap().1.get_mut() = true;
     }
 
@@ -36,30 +37,29 @@ impl<T> Clone for WsService<T> {
     }
 }
 
-impl<T> Service for WsService<T>
+impl<T> Service<(Request, Framed<T, h1::Codec>)> for WsService<T>
 where
     T: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    type Request = (Request, Framed<T, h1::Codec>);
     type Response = ();
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<(), Error>>>>;
 
-    fn poll_ready(&mut self, _ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&self, _ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.set_polled();
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, (req, mut framed): Self::Request) -> Self::Future {
+    fn call(&self, (req, mut framed): (Request, Framed<T, h1::Codec>)) -> Self::Future {
         let fut = async move {
-            let res = ws::handshake(req.head()).unwrap().message_body(());
+            let res = ws::handshake(req.head()).unwrap().message_body(()).unwrap();
 
             framed
                 .send((res, body::BodySize::None).into())
                 .await
                 .unwrap();
 
-            Dispatcher::new(framed.replace_codec(ws::Codec::new()), service)
+            Dispatcher::with(framed.replace_codec(ws::Codec::new()), service)
                 .await
                 .map_err(|_| panic!())
         };
@@ -72,7 +72,7 @@ async fn service(msg: ws::Frame) -> Result<ws::Message, Error> {
     let msg = match msg {
         ws::Frame::Ping(msg) => ws::Message::Pong(msg),
         ws::Frame::Text(text) => {
-            ws::Message::Text(String::from_utf8_lossy(&text).to_string())
+            ws::Message::Text(String::from_utf8_lossy(&text).into_owned().into())
         }
         ws::Frame::Binary(bin) => ws::Message::Binary(bin),
         ws::Frame::Continuation(item) => ws::Message::Continuation(item),
@@ -91,7 +91,7 @@ async fn test_simple() {
             let ws_service = ws_service.clone();
             HttpService::build()
                 .upgrade(fn_factory(move || future::ok::<_, ()>(ws_service.clone())))
-                .finish(|_| future::ok::<_, ()>(Response::NotFound()))
+                .finish(|_| future::ok::<_, ()>(Response::not_found()))
                 .tcp()
         }
     })
@@ -99,10 +99,7 @@ async fn test_simple() {
 
     // client service
     let mut framed = srv.ws().await.unwrap();
-    framed
-        .send(ws::Message::Text("text".to_string()))
-        .await
-        .unwrap();
+    framed.send(ws::Message::Text("text".into())).await.unwrap();
     let (item, mut framed) = framed.into_future().await;
     assert_eq!(
         item.unwrap().unwrap(),
